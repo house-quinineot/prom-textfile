@@ -18,6 +18,14 @@
 python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-exporter --debug
 ```
 
+# test
+
+仅依赖 python3 标准库：
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
 # add default job label
 
 `{prom_cronjob_interval="interval",prom_cronjob_name="job name",prom_cronjob_url="url"}`
