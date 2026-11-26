@@ -6,7 +6,7 @@
 
 获取本机里所有exporter 监控数据写入到本地的node exporter textfile目录下，prometheus获取一次就可以拿到所有的机器的全部监控。
 
-本脚本使用python3默认模块，无需安装python其他模块。
+本脚本使用python3默认模块，无需安装python其他模块。需要 Linux 和 Python 3.8 及以上；RHEL 8、openSUSE Leap 15 默认的 `python3` 是 3.6，请安装发行版自带的 `python3.11`（RHEL 8）/ `python311`（Leap 15）包，并用 `python3.11` 运行。
 
 可以使用supervisor或systemd来启动或管理进程。也可以定时任务
 
@@ -129,7 +129,16 @@ GitHub Actions 配置在 `.github/workflows/`：
 | workflow | 触发 | 内容 |
 |---|---|---|
 | `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
-| `full.yml` | push 到 main、手动触发（workflow_dispatch） | Python 3.9–3.14 × ubuntu-22.04/24.04 单元测试矩阵，全部通过后跑 node_exporter 和 remote write 集成测试 |
+| `full.yml` | push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
+
+`full.yml` 测试矩阵：
+
+| 维度 | 覆盖 |
+|---|---|
+| Python 版本 | 3.8、3.9、3.10、3.11、3.12、3.13、3.14（`actions/setup-python`） |
+| Linux 发行版 | Ubuntu 22.04 / 24.04、Debian 12 / 13、RHEL UBI 8 / 9 / 10、Fedora latest、Amazon Linux 2023、openSUSE Leap 15.6 / Tumbleweed |
+
+发行版测试在容器中运行，使用发行版自带的 `python3`（UBI 8 和 Leap 15.6 使用 `python3.11`）。
 
 来自 fork 的 pull request，首次运行 workflow 需要仓库维护者在 PR 页面批准。
 

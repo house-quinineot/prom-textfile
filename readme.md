@@ -6,7 +6,7 @@ English | [中文](readme.zh-CN.md)
 
 Scrape every exporter on the local host and write the metrics into the node exporter textfile directory, so Prometheus gets all metrics of a machine from a single scrape. Jobs can also push their metrics directly to a remote Prometheus via remote write.
 
-The script only uses the Python 3 standard library; no extra modules are needed.
+The script only uses the Python 3 standard library; no extra modules are needed. Requires Python 3.8+ on Linux. On RHEL 8 and openSUSE Leap 15, where the default `python3` is 3.6, install the distro's `python3.11` (RHEL 8) / `python311` (Leap 15) package and run the script with `python3.11`.
 
 Run it as a daemon under supervisor or systemd, or periodically as a cron job / systemd timer.
 
@@ -129,7 +129,16 @@ GitHub Actions workflows are in `.github/workflows/`:
 | Workflow | Trigger | Runs |
 |---|---|---|
 | `test.yml` | Push to non-main branches, every pull request | Python 3.12 syntax check + unit tests |
-| `full.yml` | Push to main, manual (workflow_dispatch) | Unit test matrix Python 3.9–3.14 × ubuntu-22.04/24.04, then the node_exporter and remote write integration tests |
+| `full.yml` | Push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
+
+`full.yml` test matrix:
+
+| Dimension | Coverage |
+|---|---|
+| Python versions | 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 (`actions/setup-python`) |
+| Linux distributions | Ubuntu 22.04 / 24.04, Debian 12 / 13, RHEL UBI 8 / 9 / 10, Fedora latest, Amazon Linux 2023, openSUSE Leap 15.6 / Tumbleweed |
+
+Distribution tests run in containers with the distribution's own packaged `python3` (`python3.11` on UBI 8 and Leap 15.6).
 
 For pull requests from forks, a maintainer has to approve the first workflow run on the PR page.
 
