@@ -101,15 +101,26 @@ def decode_write_request(body):
 
 
 class _RemoteWriteHandler(http.server.BaseHTTPRequestHandler):
-    """记录收到的 remote write 请求，按 codes 队列返回状态码，队列空了返回 204"""
+    """
+    记录收到的 remote write 请求，按 codes 队列返回状态码，队列空了返回 204。
+    auth 不为 None 时模拟需要认证的 prometheus：Authorization 不等于 auth 返回 401，不记录数据
+    """
 
     requests = []
     codes = []
+    auth = None
+    unauthorized = 0
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers['Content-Length']))
-        type(self).requests.append((dict(self.headers), body))
-        code = type(self).codes.pop(0) if type(self).codes else 204
+        cls = type(self)
+        if cls.auth is not None and self.headers.get('Authorization') != cls.auth:
+            cls.unauthorized += 1
+            self.send_response(401)
+            self.end_headers()
+            return
+        cls.requests.append((dict(self.headers), body))
+        code = cls.codes.pop(0) if cls.codes else 204
         self.send_response(code)
         self.end_headers()
 
@@ -140,6 +151,8 @@ class RemoteWriteServerMixin:
         logging.disable(logging.CRITICAL)
         _RemoteWriteHandler.requests = []
         _RemoteWriteHandler.codes = []
+        _RemoteWriteHandler.auth = None
+        _RemoteWriteHandler.unauthorized = 0
         self.tmp = tempfile.TemporaryDirectory()
 
     def tearDown(self):
@@ -312,6 +325,86 @@ class TestFlush(RemoteWriteServerMixin, unittest.TestCase):
             self.assertIsNone(rw.flush())
         self.assertEqual(_RemoteWriteHandler.requests, [])
         self.assertEqual(len(self.buffered(rw)), 1)
+
+
+def basic(user, password):
+    return 'Basic ' + base64.b64encode('{}:{}'.format(user, password).encode()).decode()
+
+
+class TestAuth(RemoteWriteServerMixin, unittest.TestCase):
+    """模拟需要认证的 prometheus：无认证、basic auth、bearer token，正确和错误凭据"""
+
+    def make(self, **conf):
+        conf.setdefault('prometheus_url', self.base_url + '/api/v1/write')
+        conf.setdefault('prom_file_name', 'x_job')
+        return pt.remote_write(conf, self.tmp.name)
+
+    def save(self, rw, value):
+        rw.save(['m {}\n'.format(value)], int(time.time() * 1000) - (10 - value) * 1000)
+
+    def received_values(self):
+        return [series[0][1] for series in self.sent()]
+
+    def check(self, server_auth, good, bad):
+        """bad 凭据：401，数据留在缓存；换成 good 凭据：补传，数据按顺序到达"""
+        _RemoteWriteHandler.auth = server_auth
+        rw = self.make(**bad)
+        self.save(rw, 1)
+        self.assertEqual(rw.flush(), (0, 1, 0))
+        self.assertEqual(_RemoteWriteHandler.unauthorized, 1)
+        self.assertEqual(_RemoteWriteHandler.requests, [])
+
+        rw = self.make(**good)
+        self.save(rw, 2)
+        self.assertEqual(rw.flush(), (1, 0, 0))
+        self.assertEqual(self.received_values(), [1.0, 2.0])
+        for headers, _ in _RemoteWriteHandler.requests:
+            self.assertEqual(headers.get('Authorization'), server_auth)
+
+    def test_no_auth(self):
+        rw = self.make()
+        self.save(rw, 1)
+        self.assertEqual(rw.flush(), (1, 0, 0))
+        self.assertEqual(self.received_values(), [1.0])
+        self.assertNotIn('Authorization', _RemoteWriteHandler.requests[0][0])
+
+    def test_no_auth_client_to_auth_server(self):
+        self.check(basic('u', 'p'), good={'prometheus_username': 'u', 'prometheus_password': 'p'}, bad={})
+
+    def test_basic_auth(self):
+        self.check(basic('u', 'p:w'),
+                   good={'prometheus_username': 'u', 'prometheus_password': 'p:w'},
+                   bad={'prometheus_username': 'u', 'prometheus_password': 'wrong'})
+
+    def test_basic_auth_empty_password(self):
+        self.check(basic('u', ''), good={'prometheus_username': 'u'},
+                   bad={'prometheus_username': 'other'})
+
+    def test_bearer_token(self):
+        self.check('Bearer tok', good={'prometheus_bearer_token': 'tok'},
+                   bad={'prometheus_bearer_token': 'wrong'})
+
+    def test_bearer_token_preferred_over_basic(self):
+        self.check('Bearer tok',
+                   good={'prometheus_bearer_token': 'tok', 'prometheus_username': 'u', 'prometheus_password': 'p'},
+                   bad={'prometheus_username': 'u', 'prometheus_password': 'p'})
+
+    def test_config_file_auth(self):
+        """从 ini 读取认证配置，cron 模式跑 main()"""
+        for server_auth, conf in (
+                (None, ''),
+                (basic('u', 'p:w'), 'prometheus_username : u\nprometheus_password : p:w\n'),
+                ('Bearer tok', 'prometheus_bearer_token : tok\n')):
+            with self.subTest(server_auth=server_auth), tempfile.TemporaryDirectory() as d:
+                _RemoteWriteHandler.auth = server_auth
+                _RemoteWriteHandler.requests = []
+                with open(os.path.join(d, 'a.ini'), 'w') as f:
+                    f.write('[rw]\nname : rw\nurl : {0}/metrics\ninterval : 30\n'
+                            'prometheus_url : {0}/api/v1/write\n{1}'.format(self.base_url, conf))
+                asyncio.run(pt.main(os.path.join(d, '*.ini'), d, False,
+                                    os.path.join(d, 'buffer'), os.path.join(d, 'state')))
+                self.assertEqual(len(_RemoteWriteHandler.requests), 1)
+                self.assertEqual(_RemoteWriteHandler.requests[0][0].get('Authorization'), server_auth)
 
 
 class TestEndToEnd(RemoteWriteServerMixin, unittest.TestCase):

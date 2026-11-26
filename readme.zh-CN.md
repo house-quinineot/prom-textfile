@@ -115,12 +115,18 @@ tests/integration.sh
 NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
 ```
 
-remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。占用端口 19090/19102：
+remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。同时覆盖认证：无认证、basic auth（另起一个带 `--web.config.file` 的 prometheus）、bearer token（prometheus 本身不支持 bearer token，用一个小代理放在前面）。每种情况先用错误凭据（401，数据留在缓存），再用正确凭据（补传）。需要 `htpasswd`（apache2-utils / httpd-tools），占用端口 19090/19091/19092/19102：
 
 ```sh
 tests/integration_remote_write.sh
 # 指定 prometheus 版本，默认 3.5.0
 PROMETHEUS_VERSION=3.5.0 tests/integration_remote_write.sh
+```
+
+root 场景测试（只在 CI 跑：需要免密 sudo，会写 `/var/lib/prom-textfile` 并设置 `fs.protected_regular=2`）：安装脚本后用 sudo 运行，`-c` 指向单个配置文件，`/tmp` 下留有普通用户创建的旧 `/tmp/prom-text-self.txt`：
+
+```sh
+tests/root_scenario.sh
 ```
 
 # CI
@@ -129,14 +135,14 @@ GitHub Actions 配置在 `.github/workflows/`：
 
 | workflow | 触发 | 内容 |
 |---|---|---|
-| `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
-| `full.yml` | push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
+| `test.yml` | push 到非 main 分支 | 最新正式版 Python 语法检查 + 单元测试 |
+| `full.yml` | 所有 pull request、push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
 
 `full.yml` 测试矩阵：
 
 | 维度 | 覆盖 |
 |---|---|
-| Python 版本 | 3.8、3.9、3.10、3.11、3.12、3.13、3.14（`actions/setup-python`） |
+| Python 版本 | 3.8 到最新正式版的每个小版本（`actions/setup-python`）。版本列表在运行时从 setup-python 的 [versions manifest](https://github.com/actions/python-versions) 读取，新的正式版可用后自动加入测试；目前为 3.8–3.15 |
 | Linux 发行版 | Ubuntu 22.04 / 24.04、Debian 12 / 13、RHEL UBI 8 / 9 / 10、Fedora latest、Amazon Linux 2023、openSUSE Leap 15.6 / Tumbleweed |
 
 发行版测试在容器中运行，使用发行版自带的 `python3`（UBI 8 和 Leap 15.6 使用 `python3.11`）。

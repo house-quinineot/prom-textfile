@@ -115,12 +115,18 @@ tests/integration.sh
 NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
 ```
 
-Remote write integration test: downloads Prometheus (sha256 verified), buffers data while Prometheus is not running, then starts Prometheus and checks the backfill and the written data. Uses ports 19090/19102:
+Remote write integration test: downloads Prometheus (sha256 verified), buffers data while Prometheus is not running, then starts Prometheus and checks the backfill and the written data. It also covers authentication: no auth, basic auth (a second Prometheus with `--web.config.file`) and bearer token (a small proxy in front of Prometheus, since Prometheus has no built-in bearer token auth). Each case first runs with wrong credentials (401, data stays buffered), then with correct ones (backfilled). Requires `htpasswd` (apache2-utils / httpd-tools) and uses ports 19090/19091/19092/19102:
 
 ```sh
 tests/integration_remote_write.sh
 # prometheus version, default 3.5.0
 PROMETHEUS_VERSION=3.5.0 tests/integration_remote_write.sh
+```
+
+Root scenario test (CI only: needs passwordless sudo, writes `/var/lib/prom-textfile` and sets `fs.protected_regular=2`): installs the script, runs it with sudo and `-c` pointing at a single config file, with a stale `/tmp/prom-text-self.txt` owned by a regular user:
+
+```sh
+tests/root_scenario.sh
 ```
 
 # CI
@@ -129,14 +135,14 @@ GitHub Actions workflows are in `.github/workflows/`:
 
 | Workflow | Trigger | Runs |
 |---|---|---|
-| `test.yml` | Push to non-main branches, every pull request | Python 3.12 syntax check + unit tests |
-| `full.yml` | Push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
+| `test.yml` | Push to non-main branches | Syntax check + unit tests on the latest stable Python |
+| `full.yml` | Every pull request, push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
 
 `full.yml` test matrix:
 
 | Dimension | Coverage |
 |---|---|
-| Python versions | 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 (`actions/setup-python`) |
+| Python versions | Every minor version from 3.8 to the latest stable release (`actions/setup-python`). The list is read at run time from setup-python's [versions manifest](https://github.com/actions/python-versions), so a new release is tested as soon as it is available; currently 3.8–3.15 |
 | Linux distributions | Ubuntu 22.04 / 24.04, Debian 12 / 13, RHEL UBI 8 / 9 / 10, Fedora latest, Amazon Linux 2023, openSUSE Leap 15.6 / Tumbleweed |
 
 Distribution tests run in containers with the distribution's own packaged `python3` (`python3.11` on UBI 8 and Leap 15.6).

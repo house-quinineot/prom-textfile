@@ -1,9 +1,9 @@
 name: test
 
+# 快速测试：push 到非 main 分支时跑；pull request 跑 full.yml 完整测试
 on:
   push:
     branches-ignore: [main]
-  pull_request:
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.x'
       - name: Syntax check
         run: python -W error -m py_compile prom-textfile.py tests/test_prom_textfile.py tests/test_remote_write.py
       - name: Unit tests
