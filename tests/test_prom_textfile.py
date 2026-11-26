@@ -71,9 +71,10 @@ class ServerMixin:
         cls.server.server_close()
 
 
-def make_metrics(daemon=False, interval='30'):
+def make_metrics(daemon=False, interval='30', **extra):
     conf = {'name': 'job', 'url': 'http://127.0.0.1:1/metrics',
             'interval': interval, 'prom_file_name': 'x_job', 'daemon': daemon}
+    conf.update(extra)
     p = pt.prom_metrics(conf, '/nonexistent')
     p.get_timestamp = str(int(time.time()))
     return p
@@ -187,6 +188,134 @@ class TestParse(unittest.TestCase):
                          .default_label['prom_cronjob_interval'], '30')
 
 
+class TestCustomLabels(unittest.TestCase):
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        logging.disable(logging.NOTSET)
+
+    def parse(self, text):
+        return pt.parse_custom_labels(text, 'test')
+
+    def recombine(self, line, **conf):
+        p = make_metrics(**conf)
+        return p._prom_metrics__recombine_line(line)
+
+    def load(self, text, name='a.ini'):
+        with open(os.path.join(self.tmp.name, name), 'w') as f:
+            f.write(text)
+        data = pt.config(os.path.join(self.tmp.name, name)).config_files()
+        return {d['prom_file_name']: d for d in data}
+
+    # parse_custom_labels
+
+    def test_parse_basic(self):
+        self.assertEqual(self.parse('env=prod,region=us-east'), {'env': 'prod', 'region': 'us-east'})
+
+    def test_parse_spaces_and_trailing_comma(self):
+        self.assertEqual(self.parse(' env = prod , region = us-east , '), {'env': 'prod', 'region': 'us-east'})
+
+    def test_parse_quoted(self):
+        self.assertEqual(self.parse(r'team="a,b",q="say \"hi\"",p="c:\\d"'),
+                         {'team': 'a,b', 'q': 'say "hi"', 'p': 'c:\\d'})
+
+    def test_parse_special_chars_unquoted(self):
+        self.assertEqual(self.parse('pct=50%,host=主机,url=http://x:1/a?b=c'),
+                         {'pct': '50%', 'host': '主机', 'url': 'http://x:1/a?b=c'})
+
+    def test_parse_empty(self):
+        self.assertEqual(self.parse(''), {})
+        self.assertEqual(self.parse('dc='), {'dc': ''})
+
+    def test_parse_reserved_and_invalid_names_skipped(self):
+        self.assertEqual(self.parse('__x=1,prom_cronjob_name=x,1bad=1,ok=1'), {'ok': '1'})
+
+    def test_parse_garbage_stops(self):
+        self.assertEqual(self.parse('ok=1,novalue,later=2'), {'ok': '1'})
+        self.assertEqual(self.parse('a="x"y,b=1'), {})
+
+    # config 合并
+
+    def test_config_default_and_job_labels(self):
+        conf = self.load('[DEFAULT]\nlabels : env=prod,dc=sh\ninterval : 15\n'
+                         '[node]\nname : node\nurl : http://x/1\n'
+                         '[mysql]\nname : mysql\nurl : http://x/2\ninterval : 30\nlabels : env=staging,role=db\n'
+                         '[redis]\nname : redis\nurl : http://x/3\nlabels : dc=\n')
+        self.assertEqual(sorted(conf), ['a_mysql', 'a_node', 'a_redis'])
+        self.assertEqual(conf['a_node']['custom_labels'], {'env': ('prod', 'exported'), 'dc': ('sh', 'exported')})
+        self.assertEqual(conf['a_node']['interval'], '15')
+        self.assertEqual(conf['a_mysql']['custom_labels'],
+                         {'env': ('staging', 'exported'), 'dc': ('sh', 'exported'), 'role': ('db', 'exported')})
+        self.assertEqual(conf['a_mysql']['interval'], '30')
+        self.assertEqual(conf['a_redis']['custom_labels'], {'env': ('prod', 'exported')})
+
+    def test_config_labels_and_labels_overwrite(self):
+        conf = self.load('[DEFAULT]\nlabels : env=prod,team=ops\nlabels_overwrite : dc=sh\n'
+                         '[node]\nname : node\nurl : http://x/1\ninterval : 30\n'
+                         # job 的 labels 覆盖 [DEFAULT] 的 labels_overwrite：dc 变成 exported 方式
+                         '[mysql]\nname : mysql\nurl : http://x/2\ninterval : 30\nlabels : dc=bj\n'
+                         # 同一 job 两个 key 都有：labels_overwrite 优先；空值去掉 labels_overwrite 来的 label
+                         '[redis]\nname : redis\nurl : http://x/3\ninterval : 30\n'
+                         'labels : env=a\nlabels_overwrite : env=b,dc=\n')
+        self.assertEqual(conf['a_node']['custom_labels'],
+                         {'env': ('prod', 'exported'), 'team': ('ops', 'exported'), 'dc': ('sh', 'overwrite')})
+        self.assertEqual(conf['a_mysql']['custom_labels']['dc'], ('bj', 'exported'))
+        self.assertEqual(conf['a_redis']['custom_labels'], {'env': ('b', 'overwrite'), 'team': ('ops', 'exported')})
+
+    def test_config_default_only_is_not_a_job(self):
+        self.assertEqual(self.load('[DEFAULT]\nlabels : env=prod\n'), {})
+
+    def test_config_without_labels(self):
+        conf = self.load('[node]\nname : node\nurl : http://x/1\ninterval : 30\n')
+        self.assertEqual(conf['a_node']['custom_labels'], {})
+
+    def test_config_percent_in_values(self):
+        conf = self.load('[node]\nname : node\nurl : http://x/a%20b\ninterval : 30\nlabels : pct=50%\n')
+        self.assertEqual(conf['a_node']['url'], 'http://x/a%20b')
+        self.assertEqual(conf['a_node']['custom_labels'], {'pct': ('50%', 'exported')})
+
+    # 写出
+
+    def test_custom_labels_added(self):
+        self.assertEqual(
+            self.recombine('m{a="1"} 2', custom_labels={'env': ('prod', 'exported')}),
+            'm{a="1",env="prod",prom_cronjob_interval="60",prom_cronjob_name="job",'
+            'prom_cronjob_url="http://127.0.0.1:1/metrics"} 2\n')
+
+    def test_custom_label_value_escaped(self):
+        line = self.recombine('m 1', custom_labels={'q': ('say "hi"\\n', 'overwrite')})
+        self.assertIn(r'q="say \"hi\"\\n"', line)
+        self.assertEqual(pt.parse_samples(line)[0][0]['q'], 'say "hi"\\n')
+
+    def test_conflict_labels_exported(self):
+        line = self.recombine('m{env="dev"} 1', custom_labels={'env': ('prod', 'exported')})
+        self.assertIn('env="prod"', line)
+        self.assertIn('exported_env="dev"', line)
+
+    def test_conflict_exported_twice(self):
+        line = self.recombine('m{env="dev",exported_env="old"} 1', custom_labels={'env': ('prod', 'exported')})
+        self.assertIn('{env="prod"', line)
+        self.assertIn('exported_env="old"', line)
+        self.assertIn('exported_exported_env="dev"', line)
+
+    def test_conflict_labels_overwrite(self):
+        line = self.recombine('m{env="dev"} 1', custom_labels={'env': ('prod', 'overwrite')})
+        self.assertIn('env="prod"', line)
+        self.assertNotIn('dev', line)
+
+    def test_conflict_mixed(self):
+        # 抓到 env="dev",dc="bj"；labels env=prod,team=ops；labels_overwrite dc=sh
+        line = self.recombine('m{env="dev",dc="bj"} 1', custom_labels={
+            'env': ('prod', 'exported'), 'team': ('ops', 'exported'), 'dc': ('sh', 'overwrite')})
+        self.assertEqual(pt.parse_samples(line)[0][0], {
+            '__name__': 'm', 'dc': 'sh', 'env': 'prod', 'exported_env': 'dev', 'team': 'ops',
+            'prom_cronjob_interval': '60', 'prom_cronjob_name': 'job', 'prom_cronjob_url': 'http://127.0.0.1:1/metrics'})
+
+
 class TestWriteFileAtomic(unittest.TestCase):
 
     def test_write_and_no_tmp_left(self):
@@ -283,6 +412,73 @@ class TestEndToEnd(ServerMixin, unittest.TestCase):
         self.run_main()
         self.run_main()
         self.assertRegex(self.read('ok'), r'\nprom_textfile_job_count\{[^}]*\} 2\n')
+
+
+class TestCustomLabelsEndToEnd(ServerMixin, unittest.TestCase):
+    """cron 模式完整跑一次 main()，[DEFAULT] 和 job 的 labels / labels_overwrite"""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conf_dir = os.path.join(self.tmp.name, 'conf')
+        self.out_dir = os.path.join(self.tmp.name, 'out')
+        os.mkdir(self.conf_dir)
+        os.mkdir(self.out_dir)
+        with open(os.path.join(self.conf_dir, 'c.ini'), 'w') as f:
+            f.write('[DEFAULT]\nlabels : env=prod,dc=sh\ninterval : 30\n'
+                    '[ok]\nname : ok\nurl : {0}/ok\nlabels : a=custom\n'
+                    '[over]\nname : over\nurl : {0}/ok\nlabels_overwrite : a=custom\n'
+                    '[down]\nname : down\nurl : http://127.0.0.1:1/\nlabels : dc=\n'.format(self.base_url))
+        asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False,
+                            os.path.join(self.tmp.name, 'buffer'), os.path.join(self.tmp.name, 'state')))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        logging.disable(logging.NOTSET)
+
+    def samples(self, name):
+        with open(os.path.join(self.out_dir, name)) as f:
+            return [labels for labels, _ in pt.parse_samples(f.read())]
+
+    def find(self, name, metric, **match):
+        for labels in self.samples(name):
+            if labels['__name__'] == metric and all(labels.get(k) == v for k, v in match.items()):
+                return labels
+        self.fail('{} {} not found in {}'.format(metric, match, name))
+
+    def test_no_default_job_file(self):
+        self.assertEqual(sorted(os.listdir(self.out_dir)),
+                         ['c_down.prom', 'c_ok.prom', 'c_over.prom', 'prom-textfile.prom'])
+
+    def test_scraped_metrics_exported(self):
+        m = self.find('c_ok.prom', 'm', b='x y')
+        self.assertEqual((m['a'], m['exported_a'], m['env'], m['dc']), ('custom', '1', 'prod', 'sh'))
+        # 原来没有 a 的 metric 只加 label，不产生 exported_a
+        plain = [l for l in self.samples('c_ok.prom') if l['__name__'] == 'm' and 'b' not in l][0]
+        self.assertEqual(plain['a'], 'custom')
+        self.assertNotIn('exported_a', plain)
+
+    def test_scraped_metrics_overwrite(self):
+        m = self.find('c_over.prom', 'm', b='x y')
+        self.assertEqual(m['a'], 'custom')
+        self.assertNotIn('exported_a', m)
+
+    def test_job_metrics_get_labels(self):
+        for name in ('c_ok.prom', 'c_down.prom'):
+            names = set()
+            for labels in self.samples(name):
+                if labels['__name__'].startswith('prom_textfile_job_'):
+                    names.add(labels['__name__'])
+                    self.assertEqual(labels['env'], 'prod', (name, labels))
+            self.assertEqual(names, {'prom_textfile_job_up', 'prom_textfile_job_count'})
+
+    def test_job_unsets_default_label(self):
+        for labels in self.samples('c_down.prom'):
+            self.assertNotIn('dc', labels)
+
+    def test_self_metrics_without_labels(self):
+        for labels in self.samples('prom-textfile.prom'):
+            self.assertNotIn('env', labels)
 
 
 class TestCounter(unittest.TestCase):

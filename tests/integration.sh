@@ -41,11 +41,17 @@ PIDS+=($!)
 wait_up http://127.0.0.1:19101/metrics
 wait_up http://127.0.0.1:19100/metrics
 
+# 自定义 label：labels 里的 mode 与 node_cpu_seconds_total 自带的 mode 冲突，原值应改名为 exported_mode
+# 这里不用 labels_overwrite 覆盖 mode：多个 cpu mode 会变成重复 series，node_exporter 会报错
 cat > "$WORK/conf/it.ini" <<CONF
+[DEFAULT]
+labels : env=it,team="a,b"
+
 [node]
 name : node
 url : http://127.0.0.1:19101/metrics
 interval : 1
+labels : mode=custom
 
 [down]
 name : down
@@ -63,6 +69,10 @@ check_scrape() {
     || fail "job_up for down != 0"
   n=$(grep -c 'prom_cronjob_name="node"' "$WORK/scrape.txt" || true)
   [ "$n" -gt 100 ] || fail "only $n relabeled node metrics"
+  grep -Eq '^node_cpu_seconds_total\{[^}]*env="it",exported_mode="idle",mode="custom"[^}]*team="a,b"' "$WORK/scrape.txt" \
+    || fail "custom labels / exported_mode missing on node_cpu_seconds_total"
+  grep -Eq '^prom_textfile_job_up\{[^}]*env="it"[^}]*prom_cronjob_name="down"' "$WORK/scrape.txt" \
+    || fail "custom labels missing on job_up"
   echo "ok: $n relabeled node metrics"
 }
 

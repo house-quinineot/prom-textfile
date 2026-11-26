@@ -26,6 +26,11 @@ BUFFER_MAX_SIZE = 500 * 1024 * 1024  # bytes
 # prometheus 文本格式的一行样本：name{labels} value [timestamp]
 SAMPLE_RE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{(.*)\})?\s+([^\s]+)(?:\s+(-?\d+))?\s*$')
 LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"')
+LABEL_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+# 配置里的 labels：name=value，用逗号分隔；值含逗号时用双引号
+CUSTOM_LABEL_RE = re.compile(r'\s*([^=,\s]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,"]*?)\s*(?:,|$)')
+# labels：与抓到的同名 label 冲突时原值改名为 exported_<name>；labels_overwrite：直接覆盖
+CUSTOM_LABEL_KEYS = (('labels', 'exported'), ('labels_overwrite', 'overwrite'))
 
 
 class ColorFormatter(logging.Formatter):
@@ -60,6 +65,21 @@ class config():
         self.config_path = config_path
         self.config_data = []
 
+    @staticmethod
+    def merge_custom_labels(file, defaults, section, name):
+        '''
+        返回 {label 名: (原始值, 'exported' | 'overwrite')}
+        按名字合并，后面的优先：[DEFAULT] labels < [DEFAULT] labels_overwrite < job labels < job labels_overwrite
+        空值表示这个 job 去掉该 label
+        '''
+        merged = {}
+        for where, options in (('DEFAULT', defaults), (name, section)):
+            for key, mode in CUSTOM_LABEL_KEYS:
+                labels = parse_custom_labels(options.get(key, ''), '{} [{}] {}'.format(file, where, key))
+                for label, value in labels.items():
+                    merged[label] = (value, mode)
+        return {label: v for label, v in merged.items() if v[0] != ''}
+
     def config_files(self):
         config_files = glob.glob(self.config_path)
         for f in config_files:
@@ -67,11 +87,18 @@ class config():
         return self.config_data
 
     def get_config_data(self,file):
-        config = configparser.ConfigParser()
+        # [DEFAULT] 当普通 section 读再自己合并：[DEFAULT] 不是 job，labels 按名字合并而不是整个覆盖
+        # 关闭 interpolation，label 值或 url 里的 % 不会报错
+        config = configparser.ConfigParser(default_section='prom-textfile:no-default', interpolation=None)
         config.read(file)
-        for k in config.keys():
-            d = dict(config[k])
+        defaults = dict(config['DEFAULT']) if config.has_section('DEFAULT') else {}
+        for k in config.sections():
+            if k == 'DEFAULT':
+                continue
+            d = dict(defaults)
+            d.update(config[k])
             if d:
+                d['custom_labels'] = self.merge_custom_labels(file, defaults, dict(config[k]), k)
                 s = os.path.splitext(os.path.basename(file))[0]
                 d['prom_file_name'] = s + '_' + k
                 logging.debug(
@@ -121,6 +148,35 @@ def write_file_atomic(file_path, lines):
     with open(tmp_path, 'w') as f:
         f.writelines(lines)
     os.replace(tmp_path, file_path)
+
+
+def escape_label_value(value):
+    return value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+
+def parse_custom_labels(text, where):
+    '''
+    解析配置中的 labels：env=prod,region=us-east；值含逗号时用双引号：team="a,b"
+    返回 {name: value}，value 为原始值（未转义）；空值保留，用来去掉 [DEFAULT] 里的同名 label
+    名字不合法或是保留名（__ 开头、prom_cronjob_ 开头）时记录错误并忽略该项
+    '''
+    labels = {}
+    text = text.strip()
+    pos = 0
+    while pos < len(text):
+        m = CUSTOM_LABEL_RE.match(text, pos)
+        if not m or m.end() == pos:
+            logging.error('{} : invalid labels "{}" at position {}, ignore the rest'.format(where, text, pos))
+            break
+        pos = m.end()
+        name, value = m.group(1), m.group(2)
+        if value.startswith('"'):
+            value = unescape_label_value(value[1:-1])
+        if not LABEL_NAME_RE.match(name) or name.startswith('__') or name.startswith('prom_cronjob_'):
+            logging.error('{} : invalid or reserved label name "{}", ignore'.format(where, name))
+            continue
+        labels[name] = value
+    return labels
 
 
 def unescape_label_value(value):
@@ -403,6 +459,9 @@ class prom_metrics():
             # daemon 按配置的 interval 循环；cron 模式由 timer 每 1 分钟跑一次
             'prom_cronjob_interval': config.get('interval') if self.config['daemon'] else 60
         }
+        # 配置中的自定义 label：{名字: (转义为 prom 文本格式的值, 'exported' | 'overwrite')}
+        self.custom_label = {k: (escape_label_value(v), mode)
+                             for k, (v, mode) in config.get('custom_labels', {}).items()}
 
 
     def __metric_dict(self, metric: str):
@@ -454,9 +513,9 @@ prom_textfile_job_up 1
 prom_textfile_job_up 0
 '''
 
-    def __recombine_line(self, line: str):
+    def __recombine_line(self, line: str, custom=True):
         '''
-        整理出最终的监控数据，并返回
+        整理出最终的监控数据，并返回；custom=False 时不加自定义 label
         '''
         logging.debug('__recombine_line line : {}'.format(line))
         if len(re.findall(r'^#', line)) == 0 and line != '':
@@ -466,7 +525,7 @@ prom_textfile_job_up 0
                 logging.warning('{} : skip unparsable line : {}'.format(
                     self.config.get('prom_file_name'), line))
                 return ''
-            end_metric = self.__replace_line(metric)
+            end_metric = self.__replace_line(metric, custom)
             
             logging.debug('__recombine_line end_metric : {}'.format(end_metric))
             return end_metric
@@ -490,10 +549,19 @@ prom_textfile_job_up 0
             label_dict[label] = value
         return label_dict
 
-    def __label_to_promtext(self, label_dict: dict):
+    def __label_to_promtext(self, label_dict: dict, custom=True):
         logging.debug(
             '__label_to_promtext ::  label_dict: {}'.format(label_dict))
         prom_label_text = '{'
+        if custom:
+            for name, (value, mode) in self.custom_label.items():
+                # exported：和 prometheus honor_labels: false 一样，原 label 改名为 exported_<name>
+                if name in label_dict and mode == 'exported':
+                    exported = 'exported_' + name
+                    while exported in label_dict:
+                        exported = 'exported_' + exported
+                    label_dict[exported] = label_dict[name]
+                label_dict[name] = value
         label_dict.update(self.default_label)
         for d in sorted(label_dict.keys()):
             # label_dict[d]
@@ -503,7 +571,7 @@ prom_textfile_job_up 0
         logging.debug('__label_to_promtext :: {}'.format(prom_label_text))
         return prom_label_text
 
-    def __replace_line(self,line:dict):
+    def __replace_line(self,line:dict, custom=True):
         '''
         更新label
         添加/修正 timestamp,按照timestamp排序
@@ -516,7 +584,7 @@ prom_textfile_job_up 0
 
         logging.debug('replace {}'.format(line))
         if line.get('metric_timestamp'): line['label']['metric_timestamp'] = line.get('metric_timestamp')
-        s = '{}{} {}\n'.format(line['name'], self.__label_to_promtext(line['label']),
+        s = '{}{} {}\n'.format(line['name'], self.__label_to_promtext(line['label'], custom),
                                     line['value'])
         return s
 
@@ -527,13 +595,13 @@ prom_textfile_job_up 0
         lines = [
             '# HELP prom_textfile_remote_write_up remote write accepted the last upload\n',
             '# TYPE prom_textfile_remote_write_up gauge\n',
-            self.__recombine_line('prom_textfile_remote_write_up {}'.format(up)),
+            self.__recombine_line('prom_textfile_remote_write_up {}'.format(up), custom=False),
             '# HELP prom_textfile_remote_write_buffer_files buffered files waiting for upload\n',
             '# TYPE prom_textfile_remote_write_buffer_files gauge\n',
-            self.__recombine_line('prom_textfile_remote_write_buffer_files {}'.format(buffer_files)),
+            self.__recombine_line('prom_textfile_remote_write_buffer_files {}'.format(buffer_files), custom=False),
             '# HELP prom_textfile_remote_write_rejected_files files rejected by remote write\n',
             '# TYPE prom_textfile_remote_write_rejected_files gauge\n',
-            self.__recombine_line('prom_textfile_remote_write_rejected_files {}'.format(rejected_files)),
+            self.__recombine_line('prom_textfile_remote_write_rejected_files {}'.format(rejected_files), custom=False),
         ]
         write_file_atomic('{}/{}_remote_write.prom'.format(
             self.prom_path, self.config.get('prom_file_name')), lines)

@@ -46,6 +46,53 @@ interval : 30
 | `url` | exporter 的 metrics 地址 |
 | `interval` | 抓取间隔（秒，daemon 模式） |
 | `prometheus_url` | 可选，remote write 地址，见 [remote write](#remote-write) |
+| `labels` | 可选，自定义 label；与抓到的同名 label 冲突时原值保留为 `exported_<name>`，见 [自定义 label](#自定义-label) |
+| `labels_overwrite` | 可选，自定义 label；与抓到的同名 label 冲突时直接覆盖，见 [自定义 label](#自定义-label) |
+
+`[DEFAULT]` 中的配置对同一文件里的所有 job 生效，`[DEFAULT]` 本身不是 job。
+
+## 自定义 label
+
+给 job 的所有指标加 label，包括 `prom_textfile_job_up`、`prom_textfile_job_count`，本地 textfile 和 remote write 都生效。`prom_textfile_remote_write_*` 状态指标和 `prom-textfile.prom` 不加。
+
+有两个配置项，区别只在抓到的指标已有同名 label 时：
+
+| 配置项 | 抓到 `env="dev"`，配置 `env=prod` |
+|---|---|
+| `labels` | `env="prod",exported_env="dev"`：合并，保留原值，与 prometheus `honor_labels: false` 相同 |
+| `labels_overwrite` | `env="prod"`：强制覆盖，丢弃原值 |
+
+```ini
+[DEFAULT]
+# 这个文件里的所有 job
+labels : env=prod,team=ops
+labels_overwrite : dc=sh
+
+[node]
+name : node
+url : http://localhost:9100/metrics
+interval : 30
+# 抓到 env="dev",dc="bj"，结果 env="prod",exported_env="dev",dc="sh",team="ops"
+
+[mysql]
+name : mysql
+url : http://localhost:9104/metrics
+interval : 30
+# 和 [DEFAULT] 按名字合并：env=staging、team="db,ops"、dc=sh（覆盖）
+labels : env=staging,team="db,ops"
+
+[redis]
+name : redis
+url : http://localhost:9121/metrics
+interval : 30
+# 空值去掉 [DEFAULT] 里的 label：只剩 env=prod,team=ops
+labels_overwrite : dc=
+```
+
+- 格式：`name=value`，逗号分隔；值含逗号或 `"` 时用双引号：`team="db,ops"`、`q="say \"hi\""`。
+- 两个配置项都按 label 名合并，后面的优先：`[DEFAULT] labels` < `[DEFAULT] labels_overwrite` < job `labels` < job `labels_overwrite`。空值表示这个 job 去掉该 label，不管它来自哪个配置项。
+- label 名必须匹配 `[a-zA-Z_][a-zA-Z0-9_]*`，`__` 和 `prom_cronjob_` 开头的是保留名。不合法的项记录错误后忽略，job 照常运行。
+- 用 `labels_overwrite` 覆盖用来区分 series 的 label（如 `cpu`、`mode`）要小心：不同 series 会变成重复的，node exporter 会拒绝这个文件。
 
 # remote write
 
