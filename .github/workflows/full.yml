@@ -94,3 +94,5 @@ jobs:
         run: tests/integration.sh
       - name: Integration test with prometheus remote write
         run: tests/integration_remote_write.sh
+      - name: Root scenario (sudo, -c file, stale /tmp counter)
+        run: tests/root_scenario.sh
