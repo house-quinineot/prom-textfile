@@ -22,8 +22,9 @@ python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-expor
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c, --config_path` | `/etc/prom-textfile` | 配置目录，读取其中所有 `*.ini` |
+| `-c, --config_path` | `/etc/prom-textfile` | 单个配置文件，或配置目录（读取其中所有 `*.ini`） |
 | `-p, --prometheus_node_exporter_textfile_path` | `/var/lib/prometheus/node-exporter` | node exporter textfile 目录 |
+| `-s, --state_path` | `/var/lib/prom-textfile/state` | cron 模式的运行计数文件目录 |
 | `-b, --buffer_path` | `/var/lib/prom-textfile/buffer` | remote write 缓存目录 |
 | `--daemon` | | 常驻运行，按 `interval` 循环；不加则跑一次退出（cron 模式） |
 | `--debug` | | debug 日志 |

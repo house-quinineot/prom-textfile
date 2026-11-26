@@ -17,6 +17,8 @@ import datetime
 import os
 
 DEFAULT_BUFFER_PATH = '/var/lib/prom-textfile/buffer'
+# cron 模式的运行计数文件目录，不放 /tmp：固定文件名在 /tmp 下会被其他用户抢先创建或替换成符号链接
+DEFAULT_STATE_PATH = '/var/lib/prom-textfile/state'
 # 每个 job 的缓存上限，超出后删除最旧的数据
 BUFFER_MAX_AGE = 24 * 3600 * 1000  # ms
 BUFFER_MAX_SIZE = 500 * 1024 * 1024  # bytes
@@ -322,20 +324,28 @@ class monitoring():
         self.daemon = daemon
 
     def __count_with_file(self,file_path,name):
-        if os.path.isfile(file_path):
+        '''
+        计数文件读写失败只记录错误，不影响采集
+        '''
+        counter = 0
+        try:
             with open(file_path,'r') as rf:
                 count = rf.readlines()
-                try:
-                    counter = int(count[-1])
-                except IndexError:
-                    counter = 0
-            counter +=1
-        else:
-            counter = 1
+            counter = int(count[-1])
+        except FileNotFoundError:
+            pass
+        except (IndexError, ValueError):
+            logging.warning('{} : invalid counter file {}, reset'.format(name, file_path))
+        except OSError as e:
+            logging.error('{} : read counter file {} failed: {}'.format(name, file_path, e))
+        counter +=1
         logging.debug('__count_with_file :: {} {} {}'.format(name,file_path,counter))
-        with open(file_path,'w') as wf:
-            wf.writelines(str(counter))
-        
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            write_file_atomic(file_path, str(counter))
+        except OSError as e:
+            logging.error('{} : write counter file {} failed: {}'.format(name, file_path, e))
+
         return counter
 
     def __count_with_men(self,name):
@@ -354,14 +364,14 @@ prom_textfile_job_count {}
         write_file_atomic(file_path, monitor_metric_data)
 
 
-    async def monitoring_self(self,file_path):
+    async def monitoring_self(self,file_path,count_file):
         if self.daemon:
             while True:
                 self.__count_with_men('monitoring-self')
                 self.__write_monitoring_prom(file_path,self.counter)
                 await asyncio.sleep(5)
         else:
-            counter = self.__count_with_file('/tmp/prom-text-self.txt','monitoring-self')
+            counter = self.__count_with_file(count_file,'monitoring-self')
             self.__write_monitoring_prom(file_path,counter)
             await asyncio.sleep(0.1)
 
@@ -380,9 +390,10 @@ prom_textfile_job_count {}
 
 class prom_metrics():
 
-    def __init__(self, config: dict, prom_path, buffer_path=DEFAULT_BUFFER_PATH):
+    def __init__(self, config: dict, prom_path, buffer_path=DEFAULT_BUFFER_PATH, state_path=DEFAULT_STATE_PATH):
         self.config = config
         self.prom_path = prom_path
+        self.state_path = state_path
         # 配置了 prometheus_url 的 job 写缓存目录并 remote write，不再写 textfile 目录
         self.remote = remote_write(config, buffer_path) if config.get('prometheus_url') else None
         # self.metrics_data = {}
@@ -546,7 +557,7 @@ prom_textfile_job_up 0
                                             self.config.get('prom_file_name'))
 
             # monitoring job
-            monitoring_job_count = monitoring_count.monitoring_job(int(self.config.get('interval')),'/tmp/{}.txt'.format(self.config.get('prom_file_name')))
+            monitoring_job_count = monitoring_count.monitoring_job(int(self.config.get('interval')),os.path.join(self.state_path, '{}.txt'.format(self.config.get('prom_file_name'))))
 
             metrics_data_list.append('# HELP prom_textfile_job_count job count\n')
             metrics_data_list.append('# TYPE prom_textfile_job_count counter\n')
@@ -571,26 +582,38 @@ prom_textfile_job_up 0
             else:
                 break
 
-async def run(config, prom_path, buffer_path):
+async def run(config, prom_path, buffer_path, state_path):
     logging.debug('config : {}, prom_path: {}'.format(config,prom_path))
-    p = prom_metrics(config, prom_path, buffer_path)
+    p = prom_metrics(config, prom_path, buffer_path, state_path)
     await p.start_line()
 
 
-async def main(config_path, prom_path,daemon, buffer_path=DEFAULT_BUFFER_PATH):
+def config_glob(config_path):
+    '''
+    -c 可以是单个配置文件，也可以是目录（读取其中所有 *.ini）
+    '''
+    if os.path.isfile(config_path):
+        return config_path
+    return os.path.join(config_path, '*.ini')
+
+
+async def main(config_path, prom_path,daemon, buffer_path=DEFAULT_BUFFER_PATH, state_path=DEFAULT_STATE_PATH):
     config_data = config(config_path).config_files()
     logging.info('start config:{}'.format(config_data))
+    if not config_data:
+        logging.warning('no job found in config {}'.format(config_path))
     background_tasks = set()
 
     # add task for all config job
     for i in config_data:
         i['daemon'] = daemon
-        task = asyncio.create_task(run(i, prom_path, buffer_path))
+        task = asyncio.create_task(run(i, prom_path, buffer_path, state_path))
         background_tasks.add(task)
 
     # monitoring self
     logging.debug('prom_path : {}'.format(prom_path))
-    monitoring_self = asyncio.create_task(monitoring(daemon).monitoring_self(prom_path+'/prom-textfile.prom'))
+    monitoring_self = asyncio.create_task(monitoring(daemon).monitoring_self(
+        os.path.join(prom_path, 'prom-textfile.prom'), os.path.join(state_path, 'prom-textfile-self.txt')))
     background_tasks.add(monitoring_self)
     # run
     await asyncio.gather(*background_tasks)
@@ -599,9 +622,11 @@ async def main(config_path, prom_path,daemon, buffer_path=DEFAULT_BUFFER_PATH):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_path', '-c', default='/etc/prom-textfile',
-                        help='path: /etc/prom-textfile')
+                        help='config file, or directory of *.ini files: default: /etc/prom-textfile')
     parser.add_argument('--prometheus_node_exporter_textfile_path', '-p', default='/var/lib/prometheus/node-exporter',
                         help='prometheus node exporter textfile path: default: /var/lib/prometheus/node-exporter')
+    parser.add_argument('--state_path', '-s', default=DEFAULT_STATE_PATH,
+                        help='cron mode run counter path: default: ' + DEFAULT_STATE_PATH)
     parser.add_argument('--buffer_path', '-b', default=DEFAULT_BUFFER_PATH,
                         help='remote write buffer path for jobs with prometheus_url: default: ' + DEFAULT_BUFFER_PATH)
 
@@ -633,9 +658,9 @@ if __name__ == '__main__':
     logging.info('arg: {}'.format(args))
     # run
     try:
-        asyncio.run(main(args.config_path+'/*.ini',
+        asyncio.run(main(config_glob(args.config_path),
                          args.prometheus_node_exporter_textfile_path,args.daemon,
-                         args.buffer_path))
+                         args.buffer_path, args.state_path))
     except KeyboardInterrupt:
         logging.info('end KeyboardInterrupt')
     except Exception:

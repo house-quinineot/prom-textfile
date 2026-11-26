@@ -322,25 +322,18 @@ class TestEndToEnd(RemoteWriteServerMixin, unittest.TestCase):
         self.conf_dir = os.path.join(self.tmp.name, 'conf')
         self.out_dir = os.path.join(self.tmp.name, 'out')
         self.buffer_dir = os.path.join(self.tmp.name, 'buffer')
+        self.state_dir = os.path.join(self.tmp.name, 'state')
         os.mkdir(self.conf_dir)
         os.mkdir(self.out_dir)
-        # cron 模式计数写在 /tmp/<prom_file_name>.txt，用唯一前缀避免互相影响
         self.prefix = 't' + uuid.uuid4().hex[:8]
         with open(os.path.join(self.conf_dir, self.prefix + '.ini'), 'w') as f:
             f.write('[rw]\nname: rw\nurl: {0}/metrics\ninterval: 30\n'
                     'prometheus_url: {0}/api/v1/write\n'
                     '[local]\nname: local\nurl: {0}/metrics\ninterval: 30\n'.format(self.base_url))
 
-    def tearDown(self):
-        for job in ('rw', 'local'):
-            try:
-                os.remove('/tmp/{}_{}.txt'.format(self.prefix, job))
-            except FileNotFoundError:
-                pass
-        super().tearDown()
-
     def run_main(self):
-        asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False, self.buffer_dir))
+        asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False, self.buffer_dir,
+                            self.state_dir))
 
     def status(self):
         with open(os.path.join(self.out_dir, self.prefix + '_rw_remote_write.prom')) as f:
