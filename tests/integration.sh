@@ -73,13 +73,24 @@ check_scrape
 
 echo "== daemon mode"
 rm -f "$WORK"/textfile/*
+# 非交互 bash 的后台进程会继承 SIGINT=ignore，开启 job control 才能用 kill -INT 正常停止
+set -m
 python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" --daemon >/dev/null 2>&1 &
 DPID=$!
+PIDS+=($DPID)
+set +m
 sleep 4
 check_scrape
 count=$(grep -E '^prom_textfile_job_count\{[^}]*prom_cronjob_name="node"' "$WORK/scrape.txt" | awk '{print $NF}')
 [ "$count" -ge 2 ] || fail "daemon job_count=$count, expected >= 2"
 kill -INT "$DPID"
-wait "$DPID" || fail "daemon exit code $?"
+for _ in $(seq 1 50); do
+  kill -0 "$DPID" 2>/dev/null || break
+  sleep 0.2
+done
+kill -0 "$DPID" 2>/dev/null && fail "daemon did not stop on SIGINT"
+rc=0
+wait "$DPID" || rc=$?
+[ "$rc" -eq 0 ] || fail "daemon exit code $rc"
 
 echo "integration OK"
