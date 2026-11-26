@@ -135,14 +135,14 @@ GitHub Actions workflows are in `.github/workflows/`:
 
 | Workflow | Trigger | Runs |
 |---|---|---|
-| `test.yml` | Push to non-main branches | Python 3.12 syntax check + unit tests |
+| `test.yml` | Push to non-main branches | Syntax check + unit tests on the latest stable Python |
 | `full.yml` | Every pull request, push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
 
 `full.yml` test matrix:
 
 | Dimension | Coverage |
 |---|---|
-| Python versions | 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 (`actions/setup-python`) |
+| Python versions | Every minor version from 3.8 to the latest stable release (`actions/setup-python`). The list is read at run time from setup-python's [versions manifest](https://github.com/actions/python-versions), so a new release is tested as soon as it is available; currently 3.8–3.15 |
 | Linux distributions | Ubuntu 22.04 / 24.04, Debian 12 / 13, RHEL UBI 8 / 9 / 10, Fedora latest, Amazon Linux 2023, openSUSE Leap 15.6 / Tumbleweed |
 
 Distribution tests run in containers with the distribution's own packaged `python3` (`python3.11` on UBI 8 and Leap 15.6).

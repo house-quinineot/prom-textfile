@@ -135,14 +135,14 @@ GitHub Actions 配置在 `.github/workflows/`：
 
 | workflow | 触发 | 内容 |
 |---|---|---|
-| `test.yml` | push 到非 main 分支 | Python 3.12 语法检查 + 单元测试 |
+| `test.yml` | push 到非 main 分支 | 最新正式版 Python 语法检查 + 单元测试 |
 | `full.yml` | 所有 pull request、push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
 
 `full.yml` 测试矩阵：
 
 | 维度 | 覆盖 |
 |---|---|
-| Python 版本 | 3.8、3.9、3.10、3.11、3.12、3.13、3.14（`actions/setup-python`） |
+| Python 版本 | 3.8 到最新正式版的每个小版本（`actions/setup-python`）。版本列表在运行时从 setup-python 的 [versions manifest](https://github.com/actions/python-versions) 读取，新的正式版可用后自动加入测试；目前为 3.8–3.15 |
 | Linux 发行版 | Ubuntu 22.04 / 24.04、Debian 12 / 13、RHEL UBI 8 / 9 / 10、Fedora latest、Amazon Linux 2023、openSUSE Leap 15.6 / Tumbleweed |
 
 发行版测试在容器中运行，使用发行版自带的 `python3`（UBI 8 和 Leap 15.6 使用 `python3.11`）。
