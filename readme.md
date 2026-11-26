@@ -135,8 +135,8 @@ GitHub Actions workflows are in `.github/workflows/`:
 
 | Workflow | Trigger | Runs |
 |---|---|---|
-| `test.yml` | Push to non-main branches, every pull request | Python 3.12 syntax check + unit tests |
-| `full.yml` | Push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
+| `test.yml` | Push to non-main branches | Python 3.12 syntax check + unit tests |
+| `full.yml` | Every pull request, push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
 
 `full.yml` test matrix:
 

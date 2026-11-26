@@ -1,8 +1,10 @@
 name: full test
 
+# 完整测试：pull request、合并到 main、手动触发
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:

@@ -135,8 +135,8 @@ GitHub Actions 配置在 `.github/workflows/`：
 
 | workflow | 触发 | 内容 |
 |---|---|---|
-| `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
-| `full.yml` | push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
+| `test.yml` | push 到非 main 分支 | Python 3.12 语法检查 + 单元测试 |
+| `full.yml` | 所有 pull request、push 到 main、手动触发（workflow_dispatch） | 按 Python 版本和 Linux 发行版分别跑单元测试（见下表），全部通过后跑 node_exporter 和 remote write 集成测试 |
 
 `full.yml` 测试矩阵：
 
