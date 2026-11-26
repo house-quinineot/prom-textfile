@@ -2,16 +2,30 @@
 
 import argparse
 import asyncio
+import base64
 import configparser
+import fcntl
 import glob
 import logging
 import re
+import struct
 import time
 import urllib.error
 import urllib.request
 import sys
 import datetime
 import os
+
+DEFAULT_BUFFER_PATH = '/var/lib/prom-textfile/buffer'
+# 每个 job 的缓存上限，超出后删除最旧的数据
+BUFFER_MAX_AGE = 24 * 3600 * 1000  # ms
+BUFFER_MAX_SIZE = 500 * 1024 * 1024  # bytes
+
+# prometheus 文本格式的一行样本：name{labels} value [timestamp]
+SAMPLE_RE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{(.*)\})?\s+([^\s]+)(?:\s+(-?\d+))?\s*$')
+LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"')
+
+
 class ColorFormatter(logging.Formatter):
     """Logging Formatter to add colors and count warning / errors"""
 
@@ -75,6 +89,7 @@ def fetch_url(url):
         logging.warning('get {}  ,time out!!!!!'.format(url))
         return '', 500
     except urllib.error.HTTPError as e:
+        e.close()
         logging.warning('get {}  , {}'.format(url,e))
         return '', e.code
     except urllib.error.URLError as e:
@@ -104,6 +119,201 @@ def write_file_atomic(file_path, lines):
     with open(tmp_path, 'w') as f:
         f.writelines(lines)
     os.replace(tmp_path, file_path)
+
+
+def unescape_label_value(value):
+    return re.sub(r'\\(.)', lambda m: '\n' if m.group(1) == 'n' else m.group(1), value)
+
+
+def parse_samples(text):
+    '''
+    解析 prom 文本，返回 [(labels, value)]，labels 含 __name__，label 值已反转义
+    同一个 series 出现多次时只保留最后一个，避免 remote write 报 duplicate sample
+    '''
+    samples = {}
+    for line in text.split('\n'):
+        line = line.strip()
+        if line == '' or line.startswith('#'):
+            continue
+        r = SAMPLE_RE.findall(line)
+        if not r:
+            logging.warning('remote write skip unparsable line : {}'.format(line))
+            continue
+        name, label, value, _ = r[0]
+        try:
+            value = float(value)
+        except ValueError:
+            logging.warning('remote write skip invalid value : {}'.format(line))
+            continue
+        labels = {k: unescape_label_value(v) for k, v in LABEL_RE.findall(label)}
+        labels['__name__'] = name
+        samples[tuple(sorted(labels.items()))] = (labels, value)
+    return list(samples.values())
+
+
+def _varint(n):
+    n &= 0xFFFFFFFFFFFFFFFF
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _pb_bytes(field, data):
+    return _varint(field << 3 | 2) + _varint(len(data)) + data
+
+
+def encode_write_request(samples, timestamp_ms):
+    '''
+    prometheus remote write 1.0 的 WriteRequest protobuf 编码
+      WriteRequest { repeated TimeSeries timeseries = 1; }
+      TimeSeries   { repeated Label labels = 1; repeated Sample samples = 2; }
+      Label        { string name = 1; string value = 2; }
+      Sample       { double value = 1; int64 timestamp = 2; }
+    '''
+    out = bytearray()
+    for labels, value in samples:
+        series = bytearray()
+        for k in sorted(labels):
+            series += _pb_bytes(1, _pb_bytes(1, k.encode()) + _pb_bytes(2, labels[k].encode()))
+        sample = b'\x09' + struct.pack('<d', value) + b'\x10' + _varint(timestamp_ms)
+        series += _pb_bytes(2, sample)
+        out += _pb_bytes(1, bytes(series))
+    return bytes(out)
+
+
+def snappy_compress(data):
+    '''
+    snappy block 格式，只用 literal（不做压缩），标准库就能生成接收端可解码的数据
+    '''
+    out = bytearray(_varint(len(data)))
+    for i in range(0, len(data), 65536):
+        chunk = data[i:i + 65536]
+        n = len(chunk) - 1
+        if n < 60:
+            out.append(n << 2)
+        elif n < 256:
+            out += bytes([60 << 2, n])
+        else:
+            out += bytes([61 << 2]) + struct.pack('<H', n)
+        out += chunk
+    return bytes(out)
+
+
+class remote_write():
+    '''
+    抓到的数据先按抓取时间写入 <buffer_path>/<prom_file_name>/<timestamp_ms>.prom，
+    再从旧到新上传；网络不可用时保留文件，恢复后补传
+    '''
+
+    def __init__(self, config: dict, buffer_path):
+        self.url = config['prometheus_url']
+        self.name = config.get('prom_file_name')
+        self.buffer_dir = os.path.join(buffer_path, self.name)
+        self.rejected_dir = os.path.join(self.buffer_dir, 'rejected')
+        self.headers = {
+            'Content-Encoding': 'snappy',
+            'Content-Type': 'application/x-protobuf',
+            'User-Agent': 'prom-textfile',
+            'X-Prometheus-Remote-Write-Version': '0.1.0',
+        }
+        token = config.get('prometheus_bearer_token')
+        username = config.get('prometheus_username')
+        if token:
+            self.headers['Authorization'] = 'Bearer ' + token
+        elif username:
+            auth = '{}:{}'.format(username, config.get('prometheus_password', ''))
+            self.headers['Authorization'] = 'Basic ' + base64.b64encode(auth.encode()).decode()
+
+    def save(self, lines, timestamp_ms):
+        os.makedirs(self.rejected_dir, exist_ok=True)
+        write_file_atomic(os.path.join(self.buffer_dir, '{}.prom'.format(timestamp_ms)), lines)
+
+    def __files(self, path):
+        '''
+        返回 [(timestamp_ms, file, size)]，按时间从旧到新
+        '''
+        files = []
+        for f in glob.glob(os.path.join(path, '*.prom')):
+            try:
+                files.append((int(os.path.basename(f)[:-5]), f, os.path.getsize(f)))
+            except (ValueError, OSError):
+                continue
+        return sorted(files)
+
+    def __retention(self, path, now_ms):
+        files = self.__files(path)
+        size = sum(s for _, _, s in files)
+        dropped = 0
+        for ts, f, s in files:
+            if now_ms - ts <= BUFFER_MAX_AGE and size <= BUFFER_MAX_SIZE:
+                break
+            os.remove(f)
+            size -= s
+            dropped += 1
+        if dropped:
+            logging.warning('{} : drop {} buffered file(s) over {}h / {}MB in {}'.format(
+                self.name, dropped, BUFFER_MAX_AGE // 3600000, BUFFER_MAX_SIZE // 1048576, path))
+
+    def __send(self, body):
+        request = urllib.request.Request(self.url, data=body, headers=self.headers, method='POST')
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as r:
+                return r.code
+        except urllib.error.HTTPError as e:
+            with e:
+                logging.warning('remote write {} : {} {}'.format(self.url, e.code, e.read()[:200]))
+            return e.code
+        except Exception as e:
+            logging.warning('remote write {} : {}'.format(self.url, e))
+            return None
+
+    def flush(self):
+        '''
+        阻塞执行，返回 (up, 待上传文件数, rejected 文件数)；其他进程正在上传时返回 None
+          2xx                 : 删除文件
+          400                 : 数据本身有问题，移到 rejected/ 后继续下一个
+          其他错误/网络不可用  : 保留文件，停止本轮，下个周期重试
+        '''
+        os.makedirs(self.rejected_dir, exist_ok=True)
+        with open(os.path.join(self.buffer_dir, '.lock'), 'w') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logging.info('{} : another process is uploading, skip'.format(self.name))
+                return None
+
+            now_ms = int(time.time() * 1000)
+            self.__retention(self.buffer_dir, now_ms)
+            self.__retention(self.rejected_dir, now_ms)
+
+            up = 1
+            sent = 0
+            for ts, f, _ in self.__files(self.buffer_dir):
+                with open(f) as rf:
+                    samples = parse_samples(rf.read())
+                code = self.__send(snappy_compress(encode_write_request(samples, ts)))
+                if code is not None and 200 <= code < 300:
+                    os.remove(f)
+                    sent += 1
+                elif code == 400:
+                    logging.warning('{} : remote write rejected {}, move to {}'.format(
+                        self.name, f, self.rejected_dir))
+                    os.replace(f, os.path.join(self.rejected_dir, os.path.basename(f)))
+                else:
+                    up = 0
+                    break
+
+            remaining = len(self.__files(self.buffer_dir))
+            rejected = len(self.__files(self.rejected_dir))
+            logging.info('{} : remote write sent {} file(s), {} buffered, {} rejected'.format(
+                self.name, sent, remaining, rejected))
+            return up, remaining, rejected
 
 
 class monitoring():
@@ -170,9 +380,11 @@ prom_textfile_job_count {}
 
 class prom_metrics():
 
-    def __init__(self, config: dict, prom_path):
+    def __init__(self, config: dict, prom_path, buffer_path=DEFAULT_BUFFER_PATH):
         self.config = config
         self.prom_path = prom_path
+        # 配置了 prometheus_url 的 job 写缓存目录并 remote write，不再写 textfile 目录
+        self.remote = remote_write(config, buffer_path) if config.get('prometheus_url') else None
         # self.metrics_data = {}
         self.default_label = {
             'prom_cronjob_name': config.get('name'),
@@ -190,8 +402,7 @@ class prom_metrics():
             'label': {}
         }
         timestamp_count = len(self.get_timestamp)
-        r = re.findall(
-            r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{(.*)\})?\s+([^\s]+)(?:\s+(-?\d+))?\s*$', metric)
+        r = SAMPLE_RE.findall(metric)
         logging.debug(
             '__metric dict :: metric: {}  regex: {}'.format(metric, r))
         if r:
@@ -217,7 +428,8 @@ class prom_metrics():
 
     async def __get_metrics(self):
         # # 需要处理超时/报错
-        self.get_timestamp = str(int(time.time()))
+        self.fetch_timestamp_ms = int(time.time() * 1000)
+        self.get_timestamp = str(self.fetch_timestamp_ms // 1000)
         res, code = await get_url(self.config.get('url'))
         if code == 200:
             return res + '''
@@ -259,8 +471,7 @@ prom_textfile_job_up 0
         label_dict = {}
 
         # m_label = re.compile(',?(\S+?)="?([^",]+)')
-        m_label = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"')
-        label_found = m_label.findall(label)
+        label_found = LABEL_RE.findall(label)
         logging.debug(
             '__label_to_dict :: label: {} ,  regex: {}'.format(label, label_found))
         for element in label_found:
@@ -298,6 +509,24 @@ prom_textfile_job_up 0
                                     line['value'])
         return s
 
+    def __write_remote_status(self, up, buffer_files, rejected_files):
+        '''
+        remote write 状态写到本地 textfile，远端不可用时也能通过 node exporter 告警
+        '''
+        lines = [
+            '# HELP prom_textfile_remote_write_up remote write accepted the last upload\n',
+            '# TYPE prom_textfile_remote_write_up gauge\n',
+            self.__recombine_line('prom_textfile_remote_write_up {}'.format(up)),
+            '# HELP prom_textfile_remote_write_buffer_files buffered files waiting for upload\n',
+            '# TYPE prom_textfile_remote_write_buffer_files gauge\n',
+            self.__recombine_line('prom_textfile_remote_write_buffer_files {}'.format(buffer_files)),
+            '# HELP prom_textfile_remote_write_rejected_files files rejected by remote write\n',
+            '# TYPE prom_textfile_remote_write_rejected_files gauge\n',
+            self.__recombine_line('prom_textfile_remote_write_rejected_files {}'.format(rejected_files)),
+        ]
+        write_file_atomic('{}/{}_remote_write.prom'.format(
+            self.prom_path, self.config.get('prom_file_name')), lines)
+
     async def start_line(self):
         monitoring_count = monitoring(self.config['daemon'])
         while True:
@@ -326,23 +555,29 @@ prom_textfile_job_up 0
             # write metric
             for n,d in enumerate(metrics_data_list):
                 logging.debug('write line : {} {}'.format(n,d))
-            write_file_atomic(prom_file, metrics_data_list)
+            if self.remote:
+                self.remote.save(metrics_data_list, self.fetch_timestamp_ms)
+                result = await asyncio.get_running_loop().run_in_executor(None, self.remote.flush)
+                if result:
+                    self.__write_remote_status(*result)
+            else:
+                write_file_atomic(prom_file, metrics_data_list)
 
-            logging.info('{} : write prom file {} done.'.format(
-                    self.config.get('prom_file_name'), prom_file))
+                logging.info('{} : write prom file {} done.'.format(
+                        self.config.get('prom_file_name'), prom_file))
             # run model
             if self.config['daemon']:
                 await asyncio.sleep(int(self.config.get('interval')))
             else:
                 break
 
-async def run(config, prom_path):
+async def run(config, prom_path, buffer_path):
     logging.debug('config : {}, prom_path: {}'.format(config,prom_path))
-    p = prom_metrics(config, prom_path)
+    p = prom_metrics(config, prom_path, buffer_path)
     await p.start_line()
 
 
-async def main(config_path, prom_path,daemon):
+async def main(config_path, prom_path,daemon, buffer_path=DEFAULT_BUFFER_PATH):
     config_data = config(config_path).config_files()
     logging.info('start config:{}'.format(config_data))
     background_tasks = set()
@@ -350,7 +585,7 @@ async def main(config_path, prom_path,daemon):
     # add task for all config job
     for i in config_data:
         i['daemon'] = daemon
-        task = asyncio.create_task(run(i, prom_path))
+        task = asyncio.create_task(run(i, prom_path, buffer_path))
         background_tasks.add(task)
 
     # monitoring self
@@ -367,7 +602,8 @@ if __name__ == '__main__':
                         help='path: /etc/prom-textfile')
     parser.add_argument('--prometheus_node_exporter_textfile_path', '-p', default='/var/lib/prometheus/node-exporter',
                         help='prometheus node exporter textfile path: default: /var/lib/prometheus/node-exporter')
-
+    parser.add_argument('--buffer_path', '-b', default=DEFAULT_BUFFER_PATH,
+                        help='remote write buffer path for jobs with prometheus_url: default: ' + DEFAULT_BUFFER_PATH)
 
     parser.add_argument('--daemon', action="store_true", help='daemon')
     parser.add_argument('--debug', action="store_true", help='debug')
@@ -398,7 +634,8 @@ if __name__ == '__main__':
     # run
     try:
         asyncio.run(main(args.config_path+'/*.ini',
-                         args.prometheus_node_exporter_textfile_path,args.daemon))
+                         args.prometheus_node_exporter_textfile_path,args.daemon,
+                         args.buffer_path))
     except KeyboardInterrupt:
         logging.info('end KeyboardInterrupt')
     except Exception:
