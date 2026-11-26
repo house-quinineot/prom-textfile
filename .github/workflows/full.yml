@@ -38,3 +38,5 @@ jobs:
           python-version: '3.12'
       - name: Integration test with node_exporter
         run: tests/integration.sh
+      - name: Integration test with prometheus remote write
+        run: tests/integration_remote_write.sh

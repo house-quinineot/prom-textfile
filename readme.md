@@ -18,6 +18,66 @@
 python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-exporter --debug
 ```
 
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-c, --config_path` | `/etc/prom-textfile` | 配置目录，读取其中所有 `*.ini` |
+| `-p, --prometheus_node_exporter_textfile_path` | `/var/lib/prometheus/node-exporter` | node exporter textfile 目录 |
+| `-b, --buffer_path` | `/var/lib/prom-textfile/buffer` | remote write 缓存目录 |
+| `--daemon` | | 常驻运行，按 `interval` 循环；不加则跑一次退出（cron 模式） |
+| `--debug` | | debug 日志 |
+
+# remote write
+
+配置中含有 `prometheus_url` 的 job，抓到的数据不写 textfile 目录，而是通过 [Prometheus Remote Write 1.0](https://prometheus.io/docs/specs/prw/remote_write_spec/) 直接写到远端 prometheus（protobuf + snappy 用标准库实现，无需额外依赖）。也可写入 Thanos / Mimir / VictoriaMetrics 等支持 remote write 的服务。
+
+```ini
+[node]
+name : node
+url : http://localhost:9100/metrics
+interval : 30
+prometheus_url : http://prometheus.example.com:9090/api/v1/write
+# 可选认证，同时配置时 bearer token 优先
+prometheus_username : user
+prometheus_password : pass
+prometheus_bearer_token : token
+```
+
+远端 prometheus 需要开启 remote write 接收：
+
+```sh
+prometheus --web.enable-remote-write-receiver ...
+```
+
+## 缓存与补传
+
+每次抓取的数据先写到 `<buffer_path>/<prom_file_name>/<抓取时间毫秒>.prom`，再按时间从旧到新上传，上传成功后删除：
+
+| 远端返回 | 处理 |
+|---|---|
+| 2xx | 删除缓存文件 |
+| 400 | 数据本身被拒绝（如超出时间范围），移到 `rejected/`，继续上传下一个 |
+| 其他错误、网络不可用 | 保留缓存，本轮停止，下个周期从最旧的开始补传 |
+
+- 每个 job 最多缓存 24 小时、500MB（`buffer` 和 `rejected/` 分别计算），超出删除最旧的数据。
+- 每个 job 的缓存目录有文件锁，cron 模式下前一次补传还没结束时，后一次只写缓存不上传。
+- prometheus 默认只接受最近约 1~2 小时内的样本，断网超过这个时间的数据补传会被拒绝（400，进入 `rejected/`）。需要补传更久的数据，在远端 prometheus 配置：
+
+```yaml
+storage:
+  tsdb:
+    out_of_order_time_window: 24h
+```
+
+## 状态监控
+
+remote write 状态写到本地 textfile `<prom_file_name>_remote_write.prom`，远端不可用时也能通过 node exporter 告警：
+
+| 指标 | 说明 |
+|---|---|
+| `prom_textfile_remote_write_up` | 最近一次上传是否成功（1/0） |
+| `prom_textfile_remote_write_buffer_files` | 等待上传的缓存文件数 |
+| `prom_textfile_remote_write_rejected_files` | 被远端拒绝的文件数 |
+
 # test
 
 单元测试，仅依赖 python3 标准库：
@@ -34,6 +94,14 @@ tests/integration.sh
 NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
 ```
 
+remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。占用端口 19090/19102：
+
+```sh
+tests/integration_remote_write.sh
+# 指定 prometheus 版本，默认 3.5.0
+PROMETHEUS_VERSION=3.5.0 tests/integration_remote_write.sh
+```
+
 # CI
 
 GitHub Actions 配置在 `.github/workflows/`：
@@ -41,7 +109,7 @@ GitHub Actions 配置在 `.github/workflows/`：
 | workflow | 触发 | 内容 |
 |---|---|---|
 | `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
-| `full.yml` | push 到 main、手动触发（workflow_dispatch） | Python 3.9–3.14 × ubuntu-22.04/24.04 单元测试矩阵，全部通过后跑集成测试 |
+| `full.yml` | push 到 main、手动触发（workflow_dispatch） | Python 3.9–3.14 × ubuntu-22.04/24.04 单元测试矩阵，全部通过后跑 node_exporter 和 remote write 集成测试 |
 
 来自 fork 的 pull request，首次运行 workflow 需要仓库维护者在 PR 页面批准。
 
