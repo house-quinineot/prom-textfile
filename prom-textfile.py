@@ -7,6 +7,7 @@ import glob
 import logging
 import re
 import time
+import urllib.error
 import urllib.request
 import sys
 import datetime
@@ -55,40 +56,54 @@ class config():
         for k in config.keys():
             d = dict(config[k])
             if d:
-                s = file.split('/')[-1]
-                d['prom_file_name'] = s[:-4] + '_' + k
+                s = os.path.splitext(os.path.basename(file))[0]
+                d['prom_file_name'] = s + '_' + k
                 logging.debug(
                     'file: {} ,config name: {} ,config : {}'.format(file, k, d))
                 self.config_data.append(d)
 
 
-async def get_url(url):
+def fetch_url(url):
     """
-    A coroutine to download the specified url
+    Blocking download of the specified url, run in a worker thread by get_url
     """
     try:
-        request = urllib.request.urlopen(url, timeout=5.0)
+        with urllib.request.urlopen(url, timeout=5.0) as request:
+            msg = request.read()
+            code = request.code
     except TimeoutError:
         logging.warning('get {}  ,time out!!!!!'.format(url))
         return '', 500
+    except urllib.error.HTTPError as e:
+        logging.warning('get {}  , {}'.format(url,e))
+        return '', e.code
     except urllib.error.URLError as e:
         logging.warning('get {}  , {}'.format(url,e))
         return '', 500
-    except KeyboardInterrupt:
-        logging.info('KeyboardInterrupt exit.')
-        raise KeyboardInterrupt
-    except:
+    except Exception as e:
+        logging.warning('get {}  , {}'.format(url,e))
         return '', 500
 
-    msg = b''
-    while True:
-        chunk = request.read(1024)
-        if not chunk:
-            break
+    logging.info('get {} status code : {}'.format(url, code))
+    return msg.decode(), code
 
-        msg = msg + chunk
-    logging.info('get {} status code : {}'.format(url, request.code))
-    return msg.decode(), request.code
+
+async def get_url(url):
+    """
+    A coroutine to download the specified url without blocking the event loop
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fetch_url, url)
+
+
+def write_file_atomic(file_path, lines):
+    '''
+    写临时文件再 rename，避免 node exporter 读到写了一半的 .prom
+    '''
+    tmp_path = file_path + '.tmp'
+    with open(tmp_path, 'w') as f:
+        f.writelines(lines)
+    os.replace(tmp_path, file_path)
 
 
 class monitoring():
@@ -126,8 +141,7 @@ class monitoring():
 # TYPE prom_textfile_job_count counter
 prom_textfile_job_count {}
 '''.format(count)
-        with open(file_path,'w') as f:
-            f.writelines(monitor_metric_data)
+        write_file_atomic(file_path, monitor_metric_data)
 
 
     async def monitoring_self(self,file_path):
@@ -145,10 +159,9 @@ prom_textfile_job_count {}
         # name = 
         # file_path = 
         if self.daemon:
-            while True:
-                self.__count_with_men('monitoring-job')
-                logging.debug('monitoring-job mem: {}'.format(self.counter))
-                return self.counter
+            self.__count_with_men('monitoring-job')
+            logging.debug('monitoring-job mem: {}'.format(self.counter))
+            return self.counter
         else:
             logging.debug('monitoring-job file : {}'.format(count_file))
             count = self.__count_with_file(count_file,'monitoring-job')
@@ -164,7 +177,8 @@ class prom_metrics():
         self.default_label = {
             'prom_cronjob_name': config.get('name'),
             'prom_cronjob_url': config.get('url'),
-            'prom_cronjob_interval': 60 if self.config['daemon'] else config.get('interval')
+            # daemon 按配置的 interval 循环；cron 模式由 timer 每 1 分钟跑一次
+            'prom_cronjob_interval': config.get('interval') if self.config['daemon'] else 60
         }
 
 
@@ -177,7 +191,7 @@ class prom_metrics():
         }
         timestamp_count = len(self.get_timestamp)
         r = re.findall(
-            r'^(\w+)\s?\{?(.+=.+?)?\}?\s([\d+|\-|\.|\+|e|NaN]*)\s?(\d+)?$', metric)
+            r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{(.*)\})?\s+([^\s]+)(?:\s+(-?\d+))?\s*$', metric)
         logging.debug(
             '__metric dict :: metric: {}  regex: {}'.format(metric, r))
         if r:
@@ -189,7 +203,7 @@ class prom_metrics():
                 if len(str(r[0][3])) > timestamp_count:
                     if abs(int(self.get_timestamp) - int(r[0][3][:timestamp_count])) > 600:
                         logging.debug('time 111 : : {}'.format(int(self.get_timestamp) - int(r[0][3][:timestamp_count])))
-                        date_time = datetime.datetime.fromtimestamp(int(r[0][3]))
+                        date_time = datetime.datetime.fromtimestamp(int(r[0][3][:timestamp_count]), datetime.timezone.utc)
                         metric_dict['metric_timestamp'] = date_time.strftime('%Y-%m-%d_%H:%M:%S+00')
                 else:
                     if abs(int(self.get_timestamp) - int(r[0][3])) > 600:
@@ -206,7 +220,11 @@ class prom_metrics():
         self.get_timestamp = str(int(time.time()))
         res, code = await get_url(self.config.get('url'))
         if code == 200:
-            return res
+            return res + '''
+# HELP prom_textfile_job_up job counter
+# TYPE prom_textfile_job_up counter
+prom_textfile_job_up 1
+'''
         else:
             return '''# HELP prom_textfile_job_up job counter
 # TYPE prom_textfile_job_up counter
@@ -221,6 +239,10 @@ prom_textfile_job_up 0
         if len(re.findall(r'^#', line)) == 0 and line != '':
             metric = self.__metric_dict(line)
             logging.debug('__recombine_line metric : {}'.format(metric))
+            if not metric:
+                logging.warning('{} : skip unparsable line : {}'.format(
+                    self.config.get('prom_file_name'), line))
+                return ''
             end_metric = self.__replace_line(metric)
             
             logging.debug('__recombine_line end_metric : {}'.format(end_metric))
@@ -237,7 +259,7 @@ prom_textfile_job_up 0
         label_dict = {}
 
         # m_label = re.compile(',?(\S+?)="?([^",]+)')
-        m_label = re.compile(',?(\S+?)="(.+,?)"')
+        m_label = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"')
         label_found = m_label.findall(label)
         logging.debug(
             '__label_to_dict :: label: {} ,  regex: {}'.format(label, label_found))
@@ -302,10 +324,9 @@ prom_textfile_job_up 0
             metrics_data_list.append(self.__recombine_line('prom_textfile_job_count {}'.format(monitoring_job_count)))
 
             # write metric
-            with open(prom_file, 'w') as f:
-                for n,d in enumerate(metrics_data_list):
-                    logging.debug('write line : {} {}'.format(n,d))
-                    f.writelines(d)
+            for n,d in enumerate(metrics_data_list):
+                logging.debug('write line : {} {}'.format(n,d))
+            write_file_atomic(prom_file, metrics_data_list)
 
             logging.info('{} : write prom file {} done.'.format(
                     self.config.get('prom_file_name'), prom_file))
@@ -380,9 +401,9 @@ if __name__ == '__main__':
                          args.prometheus_node_exporter_textfile_path,args.daemon))
     except KeyboardInterrupt:
         logging.info('end KeyboardInterrupt')
-    except Exception as e:
-        logging.error('end Exception', e)
-        sys.exit(1)
-    finally:
+    except Exception:
+        logging.exception('end Exception')
         logging.info('stop')
-        sys.exit(0)
+        sys.exit(1)
+    logging.info('stop')
+    sys.exit(0)

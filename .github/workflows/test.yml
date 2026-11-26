@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Syntax check
+        run: python -W error -m py_compile prom-textfile.py tests/test_prom_textfile.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

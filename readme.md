@@ -18,6 +18,33 @@
 python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-exporter --debug
 ```
 
+# test
+
+单元测试，仅依赖 python3 标准库：
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+集成测试，会下载 node_exporter（校验 sha256）并启动两个实例，验证 cron/daemon 两种模式的输出能被 textfile collector 正常读取（`node_textfile_scrape_error 0`）。需要 linux amd64、bash、curl，占用端口 19100/19101：
+
+```sh
+tests/integration.sh
+# 指定 node_exporter 版本，默认 1.9.1
+NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
+```
+
+# CI
+
+GitHub Actions 配置在 `.github/workflows/`：
+
+| workflow | 触发 | 内容 |
+|---|---|---|
+| `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
+| `full.yml` | push 到 main、手动触发（workflow_dispatch） | Python 3.9–3.14 × ubuntu-22.04/24.04 单元测试矩阵，全部通过后跑集成测试 |
+
+来自 fork 的 pull request，首次运行 workflow 需要仓库维护者在 PR 页面批准。
+
 # add default job label
 
 `{prom_cronjob_interval="interval",prom_cronjob_name="job name",prom_cronjob_url="url"}`
