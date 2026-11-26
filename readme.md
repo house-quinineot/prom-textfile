@@ -2,15 +2,17 @@
 
 # prom textfile
 
-获取本机里所有exporter 监控数据写入到本地的node exporter textfile目录下，prometheus获取一次就可以拿到所有的机器的全部监控。
+English | [中文](readme.zh-CN.md)
 
-本脚本使用python3默认模块，无需安装python其他模块。
+Scrape every exporter on the local host and write the metrics into the node exporter textfile directory, so Prometheus gets all metrics of a machine from a single scrape. Jobs can also push their metrics directly to a remote Prometheus via remote write.
 
-可以使用supervisor或systemd来启动或管理进程。也可以定时任务
+The script only uses the Python 3 standard library; no extra modules are needed. Requires Python 3.8+ on Linux. On RHEL 8 and openSUSE Leap 15, where the default `python3` is 3.6, install the distro's `python3.11` (RHEL 8) / `python311` (Leap 15) package and run the script with `python3.11`.
 
-*使用uspervisor记得开启node exporter 监控supervisor参数。*
+Run it as a daemon under supervisor or systemd, or periodically as a cron job / systemd timer.
 
-配置文件支持多文件，文件内多配置
+*When using supervisor, remember to enable the supervisord collector in node exporter.*
+
+Multiple config files are supported, and each file can contain multiple jobs.
 
 # run
 
@@ -18,17 +20,35 @@
 python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-exporter --debug
 ```
 
-| 参数 | 默认值 | 说明 |
+| Option | Default | Description |
 |---|---|---|
-| `-c, --config_path` | `/etc/prom-textfile` | 配置目录，读取其中所有 `*.ini` |
-| `-p, --prometheus_node_exporter_textfile_path` | `/var/lib/prometheus/node-exporter` | node exporter textfile 目录 |
-| `-b, --buffer_path` | `/var/lib/prom-textfile/buffer` | remote write 缓存目录 |
-| `--daemon` | | 常驻运行，按 `interval` 循环；不加则跑一次退出（cron 模式） |
-| `--debug` | | debug 日志 |
+| `-c, --config_path` | `/etc/prom-textfile` | Config directory; all `*.ini` files in it are loaded |
+| `-p, --prometheus_node_exporter_textfile_path` | `/var/lib/prometheus/node-exporter` | node exporter textfile directory |
+| `-b, --buffer_path` | `/var/lib/prom-textfile/buffer` | Remote write buffer directory |
+| `--daemon` | | Keep running and scrape every `interval`; without it, run once and exit (cron mode) |
+| `--debug` | | Debug logging |
+
+# config
+
+Each section in an `*.ini` file is one job. The output file is named `<config file name>_<section>.prom`.
+
+```ini
+[node]
+name : node
+url : http://localhost:9100/metrics
+interval : 30
+```
+
+| Key | Description |
+|---|---|
+| `name` | Job name, added as label `prom_cronjob_name` |
+| `url` | Exporter metrics URL |
+| `interval` | Scrape interval in seconds (daemon mode) |
+| `prometheus_url` | Optional, remote write URL, see [remote write](#remote-write) |
 
 # remote write
 
-配置中含有 `prometheus_url` 的 job，抓到的数据不写 textfile 目录，而是通过 [Prometheus Remote Write 1.0](https://prometheus.io/docs/specs/prw/remote_write_spec/) 直接写到远端 prometheus（protobuf + snappy 用标准库实现，无需额外依赖）。也可写入 Thanos / Mimir / VictoriaMetrics 等支持 remote write 的服务。
+Jobs with `prometheus_url` do not write to the textfile directory. Their metrics are sent directly to a remote Prometheus using [Prometheus Remote Write 1.0](https://prometheus.io/docs/specs/prw/remote_write_spec/). protobuf and snappy are implemented with the standard library, so no extra dependencies are needed. Any service that accepts remote write works, such as Thanos, Mimir or VictoriaMetrics.
 
 ```ini
 [node]
@@ -36,31 +56,31 @@ name : node
 url : http://localhost:9100/metrics
 interval : 30
 prometheus_url : http://prometheus.example.com:9090/api/v1/write
-# 可选认证，同时配置时 bearer token 优先
+# optional auth; bearer token wins when both are set
 prometheus_username : user
 prometheus_password : pass
 prometheus_bearer_token : token
 ```
 
-远端 prometheus 需要开启 remote write 接收：
+The remote Prometheus must enable the remote write receiver:
 
 ```sh
 prometheus --web.enable-remote-write-receiver ...
 ```
 
-## 缓存与补传
+## buffer and backfill
 
-每次抓取的数据先写到 `<buffer_path>/<prom_file_name>/<抓取时间毫秒>.prom`，再按时间从旧到新上传，上传成功后删除：
+Each scrape is first written to `<buffer_path>/<prom_file_name>/<scrape time in ms>.prom`, then uploaded from oldest to newest and deleted after a successful upload:
 
-| 远端返回 | 处理 |
+| Remote response | Action |
 |---|---|
-| 2xx | 删除缓存文件 |
-| 400 | 数据本身被拒绝（如超出时间范围），移到 `rejected/`，继续上传下一个 |
-| 其他错误、网络不可用 | 保留缓存，本轮停止，下个周期从最旧的开始补传 |
+| 2xx | Delete the buffered file |
+| 400 | The data itself was rejected (e.g. out of bounds); move it to `rejected/` and continue with the next file |
+| Other errors, network down | Keep the buffer and stop this round; the next cycle backfills starting from the oldest file |
 
-- 每个 job 最多缓存 24 小时、500MB（`buffer` 和 `rejected/` 分别计算），超出删除最旧的数据。
-- 每个 job 的缓存目录有文件锁，cron 模式下前一次补传还没结束时，后一次只写缓存不上传。
-- prometheus 默认只接受最近约 1~2 小时内的样本，断网超过这个时间的数据补传会被拒绝（400，进入 `rejected/`）。需要补传更久的数据，在远端 prometheus 配置：
+- Each job buffers at most 24 hours and 500MB (counted separately for the buffer and `rejected/`); beyond that the oldest data is dropped.
+- Each job's buffer directory is protected by a file lock. In cron mode, if the previous run is still backfilling, the next run only writes to the buffer and skips uploading.
+- By default Prometheus only accepts samples from roughly the last 1–2 hours. Backfilled data from a longer outage is rejected (400, moved to `rejected/`). To backfill older data, configure the remote Prometheus:
 
 ```yaml
 storage:
@@ -68,60 +88,71 @@ storage:
     out_of_order_time_window: 24h
 ```
 
-## 状态监控
+## status metrics
 
-remote write 状态写到本地 textfile `<prom_file_name>_remote_write.prom`，远端不可用时也能通过 node exporter 告警：
+Remote write status is written to the local textfile `<prom_file_name>_remote_write.prom`, so you can still alert through node exporter when the remote is unavailable:
 
-| 指标 | 说明 |
+| Metric | Description |
 |---|---|
-| `prom_textfile_remote_write_up` | 最近一次上传是否成功（1/0） |
-| `prom_textfile_remote_write_buffer_files` | 等待上传的缓存文件数 |
-| `prom_textfile_remote_write_rejected_files` | 被远端拒绝的文件数 |
+| `prom_textfile_remote_write_up` | Whether the last upload succeeded (1/0) |
+| `prom_textfile_remote_write_buffer_files` | Number of buffered files waiting for upload |
+| `prom_textfile_remote_write_rejected_files` | Number of files rejected by the remote |
 
 # test
 
-单元测试，仅依赖 python3 标准库：
+Unit tests, Python 3 standard library only:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-集成测试，会下载 node_exporter（校验 sha256）并启动两个实例，验证 cron/daemon 两种模式的输出能被 textfile collector 正常读取（`node_textfile_scrape_error 0`）。需要 linux amd64、bash、curl，占用端口 19100/19101：
+Integration test: downloads node_exporter (sha256 verified), starts two instances, and checks that the output of both cron and daemon mode is read by the textfile collector without errors (`node_textfile_scrape_error 0`). Requires linux amd64, bash and curl, and uses ports 19100/19101:
 
 ```sh
 tests/integration.sh
-# 指定 node_exporter 版本，默认 1.9.1
+# node_exporter version, default 1.9.1
 NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
 ```
 
-remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。占用端口 19090/19102：
+Remote write integration test: downloads Prometheus (sha256 verified), buffers data while Prometheus is not running, then starts Prometheus and checks the backfill and the written data. Uses ports 19090/19102:
 
 ```sh
 tests/integration_remote_write.sh
-# 指定 prometheus 版本，默认 3.5.0
+# prometheus version, default 3.5.0
 PROMETHEUS_VERSION=3.5.0 tests/integration_remote_write.sh
 ```
 
 # CI
 
-GitHub Actions 配置在 `.github/workflows/`：
+GitHub Actions workflows are in `.github/workflows/`:
 
-| workflow | 触发 | 内容 |
+| Workflow | Trigger | Runs |
 |---|---|---|
-| `test.yml` | push 到非 main 分支、所有 pull request | Python 3.12 语法检查 + 单元测试 |
-| `full.yml` | push 到 main、手动触发（workflow_dispatch） | Python 3.9–3.14 × ubuntu-22.04/24.04 单元测试矩阵，全部通过后跑 node_exporter 和 remote write 集成测试 |
+| `test.yml` | Push to non-main branches, every pull request | Python 3.12 syntax check + unit tests |
+| `full.yml` | Push to main, manual (workflow_dispatch) | Unit tests on each Python version and each Linux distribution (below), then the node_exporter and remote write integration tests |
 
-来自 fork 的 pull request，首次运行 workflow 需要仓库维护者在 PR 页面批准。
+`full.yml` test matrix:
 
-# add default job label
+| Dimension | Coverage |
+|---|---|
+| Python versions | 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 (`actions/setup-python`) |
+| Linux distributions | Ubuntu 22.04 / 24.04, Debian 12 / 13, RHEL UBI 8 / 9 / 10, Fedora latest, Amazon Linux 2023, openSUSE Leap 15.6 / Tumbleweed |
+
+Distribution tests run in containers with the distribution's own packaged `python3` (`python3.11` on UBI 8 and Leap 15.6).
+
+For pull requests from forks, a maintainer has to approve the first workflow run on the PR page.
+
+# default job labels
 
 `{prom_cronjob_interval="interval",prom_cronjob_name="job name",prom_cronjob_url="url"}`
 
-# 增加监控项
+# extra metrics
 
-prom_textfile_job_up
+| Metric | Description |
+|---|---|
+| `prom_textfile_job_up` | Whether the last scrape of the job succeeded (1/0) |
+| `prom_textfile_job_count` | Number of runs of the job |
 
-prom_textfile_job_count
 # install
 
 ## install prom-textfile
@@ -260,4 +291,3 @@ sudo rm -f /usr/lib/systemd/system/prom-textfile.timer
 sudo rm -f /usr/lib/systemd/system/prom-textfile.service
 sudo systemctl daemon-reload
 ```
-

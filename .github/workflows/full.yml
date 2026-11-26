@@ -9,26 +9,80 @@ permissions:
   contents: read
 
 jobs:
-  unittest:
-    runs-on: ${{ matrix.os }}
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Syntax check
-        run: python -W error -m py_compile prom-textfile.py tests/test_prom_textfile.py
+        run: python -W error -m py_compile prom-textfile.py tests/test_prom_textfile.py tests/test_remote_write.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
+  distro:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 使用发行版自带的 python3；默认 python3 为 3.6 的发行版改用官方源里的 python3.11
+          - image: ubuntu:22.04
+            install: apt-get update && apt-get install -y python3 git
+            python: python3
+          - image: ubuntu:24.04
+            install: apt-get update && apt-get install -y python3 git
+            python: python3
+          - image: debian:12
+            install: apt-get update && apt-get install -y python3 git
+            python: python3
+          - image: debian:13
+            install: apt-get update && apt-get install -y python3 git
+            python: python3
+          - image: registry.access.redhat.com/ubi8/ubi
+            install: dnf install -y python3.11 git tar
+            python: python3.11
+          - image: registry.access.redhat.com/ubi9/ubi
+            install: dnf install -y python3 git tar
+            python: python3
+          - image: registry.access.redhat.com/ubi10/ubi
+            install: dnf install -y python3 git tar
+            python: python3
+          - image: fedora:latest
+            install: dnf install -y python3 git tar
+            python: python3
+          - image: amazonlinux:2023
+            install: dnf install -y python3 git tar
+            python: python3
+          - image: opensuse/leap:15.6
+            install: zypper -n install python311 git tar gzip
+            python: python3.11
+          - image: opensuse/tumbleweed
+            install: zypper -n install python3 git tar gzip
+            python: python3
+    steps:
+      - name: Install python
+        run: ${{ matrix.install }}
+      - uses: actions/checkout@v5
+      - name: Python version
+        run: ${{ matrix.python }} --version
+      - name: Syntax check
+        run: ${{ matrix.python }} -W error -m py_compile prom-textfile.py tests/test_prom_textfile.py tests/test_remote_write.py
+      - name: Unit tests
+        run: ${{ matrix.python }} -m unittest discover -s tests -v
+
   integration:
-    needs: unittest
+    needs: [python, distro]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
