@@ -67,7 +67,7 @@ check_scrape() {
 }
 
 echo "== cron mode"
-python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile"
+python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" -s "$WORK/state"
 if ls "$WORK/textfile" | grep -q '\.tmp$'; then fail "tmp file left"; fi
 check_scrape
 
@@ -75,7 +75,7 @@ echo "== daemon mode"
 rm -f "$WORK"/textfile/*
 # 非交互 bash 的后台进程会继承 SIGINT=ignore，开启 job control 才能用 kill -INT 正常停止
 set -m
-python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" --daemon >/dev/null 2>&1 &
+python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" -s "$WORK/state" --daemon >/dev/null 2>&1 &
 DPID=$!
 PIDS+=($DPID)
 set +m

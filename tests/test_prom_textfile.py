@@ -235,9 +235,9 @@ class TestEndToEnd(ServerMixin, unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.conf_dir = os.path.join(self.tmp.name, 'conf')
         self.out_dir = os.path.join(self.tmp.name, 'out')
+        self.state_dir = os.path.join(self.tmp.name, 'state')
         os.mkdir(self.conf_dir)
         os.mkdir(self.out_dir)
-        # cron 模式计数写在 /tmp/<prom_file_name>.txt，用唯一前缀避免互相影响
         self.prefix = 't' + uuid.uuid4().hex[:8]
         with open(os.path.join(self.conf_dir, self.prefix + '.ini'), 'w') as f:
             f.write('[ok]\nname: ok\nurl: {0}/ok\ninterval: 30\n'
@@ -245,16 +245,12 @@ class TestEndToEnd(ServerMixin, unittest.TestCase):
                     .format(self.base_url))
 
     def tearDown(self):
-        for job in ('ok', 'down'):
-            try:
-                os.remove('/tmp/{}_{}.txt'.format(self.prefix, job))
-            except FileNotFoundError:
-                pass
         self.tmp.cleanup()
         logging.disable(logging.NOTSET)
 
     def run_main(self):
-        asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False))
+        asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False,
+                            os.path.join(self.tmp.name, 'buffer'), self.state_dir))
 
     def read(self, job):
         with open(os.path.join(self.out_dir, '{}_{}.prom'.format(self.prefix, job))) as f:
@@ -278,22 +274,80 @@ class TestEndToEnd(ServerMixin, unittest.TestCase):
         self.run_main()
         self.assertRegex(self.read('down'), r'prom_textfile_job_up\{[^}]*\} 0\n')
 
+    def test_counters_in_state_dir(self):
+        self.run_main()
+        self.assertEqual(sorted(os.listdir(self.state_dir)), sorted([
+            'prom-textfile-self.txt', self.prefix + '_ok.txt', self.prefix + '_down.txt']))
+
     def test_cron_counter_increments(self):
         self.run_main()
         self.run_main()
         self.assertRegex(self.read('ok'), r'\nprom_textfile_job_count\{[^}]*\} 2\n')
 
 
+class TestCounter(unittest.TestCase):
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.count = pt.monitoring(False)._monitoring__count_with_file
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        logging.disable(logging.NOTSET)
+
+    def test_creates_dir_and_increments(self):
+        path = os.path.join(self.tmp.name, 'a', 'b', 'c.txt')
+        self.assertEqual([self.count(path, 'x') for _ in range(3)], [1, 2, 3])
+
+    def test_invalid_content_resets(self):
+        path = os.path.join(self.tmp.name, 'c.txt')
+        with open(path, 'w') as f:
+            f.write('abc')
+        self.assertEqual(self.count(path, 'x'), 1)
+
+    def test_unwritable_does_not_raise(self):
+        # 父路径是普通文件，root 也无法写入
+        blocker = os.path.join(self.tmp.name, 'file')
+        open(blocker, 'w').close()
+        self.assertEqual(self.count(os.path.join(blocker, 'c.txt'), 'x'), 1)
+
+
 class TestCli(unittest.TestCase):
+
+    def run_cli(self, d, *args):
+        return subprocess.run([sys.executable, SCRIPT, '-s', os.path.join(d, 'state'),
+                               '-b', os.path.join(d, 'buffer')] + list(args), capture_output=True)
+
+    def write_conf(self, d):
+        path = os.path.join(d, 'a.ini')
+        with open(path, 'w') as f:
+            f.write('[n]\nname: n\nurl: http://127.0.0.1:1/\ninterval: 30\n')
+        return path
 
     def test_exit_code_on_error(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, 'a.ini'), 'w') as f:
-                f.write('[n]\nname: n\nurl: http://127.0.0.1:1/\ninterval: 30\n')
-            r = subprocess.run([sys.executable, SCRIPT, '-c', d, '-p', os.path.join(d, 'missing')],
-                               capture_output=True)
+            self.write_conf(d)
+            r = self.run_cli(d, '-c', d, '-p', os.path.join(d, 'missing'))
             self.assertEqual(r.returncode, 1)
             self.assertIn(b'Traceback', r.stderr)
+
+    def test_config_path_dir_or_file(self):
+        for use_file in (False, True):
+            with self.subTest(use_file=use_file), tempfile.TemporaryDirectory() as d:
+                conf = self.write_conf(d)
+                out = os.path.join(d, 'out')
+                os.mkdir(out)
+                r = self.run_cli(d, '-c', conf if use_file else d, '-p', out)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('a_n.prom', os.listdir(out))
+
+    def test_config_glob(self):
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, 'a.ini')
+            open(conf, 'w').close()
+            self.assertEqual(pt.config_glob(conf), conf)
+            self.assertEqual(pt.config_glob(d), os.path.join(d, '*.ini'))
 
 
 if __name__ == '__main__':

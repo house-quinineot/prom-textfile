@@ -66,7 +66,7 @@ status() {
 echo "== prometheus down, buffer"
 # 非交互 bash 的后台进程会继承 SIGINT=ignore，开启 job control 才能用 kill -INT 正常停止
 set -m
-python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" -b "$WORK/buffer" --daemon >/dev/null 2>&1 &
+python3 "$ROOT/prom-textfile.py" -c "$WORK/conf" -p "$WORK/textfile" -s "$WORK/state" -b "$WORK/buffer" --daemon >/dev/null 2>&1 &
 DPID=$!
 PIDS+=($DPID)
 set +m

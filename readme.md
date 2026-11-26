@@ -22,8 +22,9 @@ python3 prom-textfile.py -c /etc/prom-textfile -p /var/lib/prometheus/node-expor
 
 | Option | Default | Description |
 |---|---|---|
-| `-c, --config_path` | `/etc/prom-textfile` | Config directory; all `*.ini` files in it are loaded |
+| `-c, --config_path` | `/etc/prom-textfile` | A config file, or a directory whose `*.ini` files are all loaded |
 | `-p, --prometheus_node_exporter_textfile_path` | `/var/lib/prometheus/node-exporter` | node exporter textfile directory |
+| `-s, --state_path` | `/var/lib/prom-textfile/state` | Run counter files for cron mode |
 | `-b, --buffer_path` | `/var/lib/prom-textfile/buffer` | Remote write buffer directory |
 | `--daemon` | | Keep running and scrape every `interval`; without it, run once and exit (cron mode) |
 | `--debug` | | Debug logging |
