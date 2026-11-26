@@ -46,8 +46,8 @@ interval : 30
 | `url` | Exporter metrics URL |
 | `interval` | Scrape interval in seconds (daemon mode) |
 | `prometheus_url` | Optional, remote write URL, see [remote write](#remote-write) |
-| `labels` | Optional, custom labels, see [custom labels](#custom-labels) |
-| `labels_conflict` | Optional, `exported` (default) or `overwrite`, see [custom labels](#custom-labels) |
+| `labels` | Optional, custom labels; on a clash the scraped label is kept as `exported_<name>`, see [custom labels](#custom-labels) |
+| `labels_overwrite` | Optional, custom labels that overwrite a scraped label with the same name, see [custom labels](#custom-labels) |
 
 Keys in a `[DEFAULT]` section apply to every job in the same file. `[DEFAULT]` itself is not a job.
 
@@ -55,41 +55,44 @@ Keys in a `[DEFAULT]` section apply to every job in the same file. `[DEFAULT]` i
 
 Add labels to every metric of a job, including `prom_textfile_job_up` and `prom_textfile_job_count`, both in the local textfile and in remote write. The `prom_textfile_remote_write_*` status metrics and `prom-textfile.prom` are not changed.
 
+There are two keys. They differ only when the scraped metric already has a label with the same name:
+
+| Key | Scraped `env="dev"`, config `env=prod` |
+|---|---|
+| `labels` | `env="prod",exported_env="dev"`: merged, the scraped value is kept, same as Prometheus with `honor_labels: false` |
+| `labels_overwrite` | `env="prod"`: overwritten, the scraped value is dropped |
+
 ```ini
 [DEFAULT]
 # every job in this file
-labels : env=prod,dc=sh
+labels : env=prod,team=ops
+labels_overwrite : dc=sh
 
 [node]
 name : node
 url : http://localhost:9100/metrics
 interval : 30
+# scraped env="dev",dc="bj" becomes env="prod",exported_env="dev",dc="sh",team="ops"
 
 [mysql]
 name : mysql
 url : http://localhost:9104/metrics
 interval : 30
-# merged with [DEFAULT] by name: env=staging,dc=sh,team="db,ops"
+# merged with [DEFAULT] by name: env=staging, team="db,ops", dc=sh (overwrite)
 labels : env=staging,team="db,ops"
 
 [redis]
 name : redis
 url : http://localhost:9121/metrics
 interval : 30
-# an empty value removes a [DEFAULT] label: env=prod only
-labels : dc=
-labels_conflict : overwrite
+# an empty value removes a [DEFAULT] label: only env=prod,team=ops
+labels_overwrite : dc=
 ```
 
 - Format: `name=value` separated by commas. Quote a value that contains a comma or `"`: `team="db,ops"`, `q="say \"hi\""`.
-- A job's `labels` is merged with `[DEFAULT]` by label name; the job wins. An empty value removes that label for the job.
+- Both keys are merged by label name, later wins: `[DEFAULT] labels` < `[DEFAULT] labels_overwrite` < job `labels` < job `labels_overwrite`. An empty value removes that label for the job, whichever key set it.
 - Label names must match `[a-zA-Z_][a-zA-Z0-9_]*`. Names starting with `__` or `prom_cronjob_` are reserved. Invalid entries are logged as errors and ignored; the job keeps running.
-- When a scraped metric already has a label with the same name, `labels_conflict` decides:
-
-| `labels_conflict` | Scraped `env="dev"`, config `env=prod` |
-|---|---|
-| `exported` (default) | `env="prod",exported_env="dev"`, same as Prometheus with `honor_labels: false` |
-| `overwrite` | `env="prod"`, the scraped value is dropped |
+- Be careful with `labels_overwrite` on a label that tells series apart (e.g. `cpu`, `mode`): different series then become duplicates and node exporter rejects the file.
 
 # remote write
 

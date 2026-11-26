@@ -246,11 +246,25 @@ class TestCustomLabels(unittest.TestCase):
                          '[mysql]\nname : mysql\nurl : http://x/2\ninterval : 30\nlabels : env=staging,role=db\n'
                          '[redis]\nname : redis\nurl : http://x/3\nlabels : dc=\n')
         self.assertEqual(sorted(conf), ['a_mysql', 'a_node', 'a_redis'])
-        self.assertEqual(conf['a_node']['custom_labels'], {'env': 'prod', 'dc': 'sh'})
+        self.assertEqual(conf['a_node']['custom_labels'], {'env': ('prod', 'exported'), 'dc': ('sh', 'exported')})
         self.assertEqual(conf['a_node']['interval'], '15')
-        self.assertEqual(conf['a_mysql']['custom_labels'], {'env': 'staging', 'dc': 'sh', 'role': 'db'})
+        self.assertEqual(conf['a_mysql']['custom_labels'],
+                         {'env': ('staging', 'exported'), 'dc': ('sh', 'exported'), 'role': ('db', 'exported')})
         self.assertEqual(conf['a_mysql']['interval'], '30')
-        self.assertEqual(conf['a_redis']['custom_labels'], {'env': 'prod'})
+        self.assertEqual(conf['a_redis']['custom_labels'], {'env': ('prod', 'exported')})
+
+    def test_config_labels_and_labels_overwrite(self):
+        conf = self.load('[DEFAULT]\nlabels : env=prod,team=ops\nlabels_overwrite : dc=sh\n'
+                         '[node]\nname : node\nurl : http://x/1\ninterval : 30\n'
+                         # job 的 labels 覆盖 [DEFAULT] 的 labels_overwrite：dc 变成 exported 方式
+                         '[mysql]\nname : mysql\nurl : http://x/2\ninterval : 30\nlabels : dc=bj\n'
+                         # 同一 job 两个 key 都有：labels_overwrite 优先；空值去掉 labels_overwrite 来的 label
+                         '[redis]\nname : redis\nurl : http://x/3\ninterval : 30\n'
+                         'labels : env=a\nlabels_overwrite : env=b,dc=\n')
+        self.assertEqual(conf['a_node']['custom_labels'],
+                         {'env': ('prod', 'exported'), 'team': ('ops', 'exported'), 'dc': ('sh', 'overwrite')})
+        self.assertEqual(conf['a_mysql']['custom_labels']['dc'], ('bj', 'exported'))
+        self.assertEqual(conf['a_redis']['custom_labels'], {'env': ('b', 'overwrite'), 'team': ('ops', 'exported')})
 
     def test_config_default_only_is_not_a_job(self):
         self.assertEqual(self.load('[DEFAULT]\nlabels : env=prod\n'), {})
@@ -262,41 +276,44 @@ class TestCustomLabels(unittest.TestCase):
     def test_config_percent_in_values(self):
         conf = self.load('[node]\nname : node\nurl : http://x/a%20b\ninterval : 30\nlabels : pct=50%\n')
         self.assertEqual(conf['a_node']['url'], 'http://x/a%20b')
-        self.assertEqual(conf['a_node']['custom_labels'], {'pct': '50%'})
+        self.assertEqual(conf['a_node']['custom_labels'], {'pct': ('50%', 'exported')})
 
     # 写出
 
     def test_custom_labels_added(self):
         self.assertEqual(
-            self.recombine('m{a="1"} 2', custom_labels={'env': 'prod'}),
+            self.recombine('m{a="1"} 2', custom_labels={'env': ('prod', 'exported')}),
             'm{a="1",env="prod",prom_cronjob_interval="60",prom_cronjob_name="job",'
             'prom_cronjob_url="http://127.0.0.1:1/metrics"} 2\n')
 
     def test_custom_label_value_escaped(self):
-        line = self.recombine('m 1', custom_labels={'q': 'say "hi"\\n'})
+        line = self.recombine('m 1', custom_labels={'q': ('say "hi"\\n', 'overwrite')})
         self.assertIn(r'q="say \"hi\"\\n"', line)
         self.assertEqual(pt.parse_samples(line)[0][0]['q'], 'say "hi"\\n')
 
-    def test_conflict_exported_is_default(self):
-        line = self.recombine('m{env="dev"} 1', custom_labels={'env': 'prod'})
+    def test_conflict_labels_exported(self):
+        line = self.recombine('m{env="dev"} 1', custom_labels={'env': ('prod', 'exported')})
         self.assertIn('env="prod"', line)
         self.assertIn('exported_env="dev"', line)
 
     def test_conflict_exported_twice(self):
-        line = self.recombine('m{env="dev",exported_env="old"} 1', custom_labels={'env': 'prod'},
-                              labels_conflict='exported')
+        line = self.recombine('m{env="dev",exported_env="old"} 1', custom_labels={'env': ('prod', 'exported')})
         self.assertIn('{env="prod"', line)
         self.assertIn('exported_env="old"', line)
         self.assertIn('exported_exported_env="dev"', line)
 
-    def test_conflict_overwrite(self):
-        line = self.recombine('m{env="dev"} 1', custom_labels={'env': 'prod'}, labels_conflict='overwrite')
+    def test_conflict_labels_overwrite(self):
+        line = self.recombine('m{env="dev"} 1', custom_labels={'env': ('prod', 'overwrite')})
         self.assertIn('env="prod"', line)
         self.assertNotIn('dev', line)
 
-    def test_conflict_invalid_falls_back_to_exported(self):
-        line = self.recombine('m{env="dev"} 1', custom_labels={'env': 'prod'}, labels_conflict='bad')
-        self.assertIn('exported_env="dev"', line)
+    def test_conflict_mixed(self):
+        # 抓到 env="dev",dc="bj"；labels env=prod,team=ops；labels_overwrite dc=sh
+        line = self.recombine('m{env="dev",dc="bj"} 1', custom_labels={
+            'env': ('prod', 'exported'), 'team': ('ops', 'exported'), 'dc': ('sh', 'overwrite')})
+        self.assertEqual(pt.parse_samples(line)[0][0], {
+            '__name__': 'm', 'dc': 'sh', 'env': 'prod', 'exported_env': 'dev', 'team': 'ops',
+            'prom_cronjob_interval': '60', 'prom_cronjob_name': 'job', 'prom_cronjob_url': 'http://127.0.0.1:1/metrics'})
 
 
 class TestWriteFileAtomic(unittest.TestCase):
@@ -398,7 +415,7 @@ class TestEndToEnd(ServerMixin, unittest.TestCase):
 
 
 class TestCustomLabelsEndToEnd(ServerMixin, unittest.TestCase):
-    """cron 模式完整跑一次 main()，[DEFAULT] 和 job 的 labels、两种冲突处理"""
+    """cron 模式完整跑一次 main()，[DEFAULT] 和 job 的 labels / labels_overwrite"""
 
     def setUp(self):
         logging.disable(logging.CRITICAL)
@@ -410,7 +427,7 @@ class TestCustomLabelsEndToEnd(ServerMixin, unittest.TestCase):
         with open(os.path.join(self.conf_dir, 'c.ini'), 'w') as f:
             f.write('[DEFAULT]\nlabels : env=prod,dc=sh\ninterval : 30\n'
                     '[ok]\nname : ok\nurl : {0}/ok\nlabels : a=custom\n'
-                    '[over]\nname : over\nurl : {0}/ok\nlabels : a=custom\nlabels_conflict : overwrite\n'
+                    '[over]\nname : over\nurl : {0}/ok\nlabels_overwrite : a=custom\n'
                     '[down]\nname : down\nurl : http://127.0.0.1:1/\nlabels : dc=\n'.format(self.base_url))
         asyncio.run(pt.main(os.path.join(self.conf_dir, '*.ini'), self.out_dir, False,
                             os.path.join(self.tmp.name, 'buffer'), os.path.join(self.tmp.name, 'state')))

@@ -41,7 +41,8 @@ PIDS+=($!)
 wait_up http://127.0.0.1:19101/metrics
 wait_up http://127.0.0.1:19100/metrics
 
-# 自定义 label：mode 与 node_cpu_seconds_total 自带的 mode 冲突，原值应改名为 exported_mode
+# 自定义 label：labels 里的 mode 与 node_cpu_seconds_total 自带的 mode 冲突，原值应改名为 exported_mode
+# 这里不用 labels_overwrite 覆盖 mode：多个 cpu mode 会变成重复 series，node_exporter 会报错
 cat > "$WORK/conf/it.ini" <<CONF
 [DEFAULT]
 labels : env=it,team="a,b"

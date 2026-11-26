@@ -29,7 +29,8 @@ LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"')
 LABEL_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 # 配置里的 labels：name=value，用逗号分隔；值含逗号时用双引号
 CUSTOM_LABEL_RE = re.compile(r'\s*([^=,\s]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,"]*?)\s*(?:,|$)')
-LABELS_CONFLICT = ('exported', 'overwrite')
+# labels：与抓到的同名 label 冲突时原值改名为 exported_<name>；labels_overwrite：直接覆盖
+CUSTOM_LABEL_KEYS = (('labels', 'exported'), ('labels_overwrite', 'overwrite'))
 
 
 class ColorFormatter(logging.Formatter):
@@ -64,6 +65,21 @@ class config():
         self.config_path = config_path
         self.config_data = []
 
+    @staticmethod
+    def merge_custom_labels(file, defaults, section, name):
+        '''
+        返回 {label 名: (原始值, 'exported' | 'overwrite')}
+        按名字合并，后面的优先：[DEFAULT] labels < [DEFAULT] labels_overwrite < job labels < job labels_overwrite
+        空值表示这个 job 去掉该 label
+        '''
+        merged = {}
+        for where, options in (('DEFAULT', defaults), (name, section)):
+            for key, mode in CUSTOM_LABEL_KEYS:
+                labels = parse_custom_labels(options.get(key, ''), '{} [{}] {}'.format(file, where, key))
+                for label, value in labels.items():
+                    merged[label] = (value, mode)
+        return {label: v for label, v in merged.items() if v[0] != ''}
+
     def config_files(self):
         config_files = glob.glob(self.config_path)
         for f in config_files:
@@ -76,17 +92,13 @@ class config():
         config = configparser.ConfigParser(default_section='prom-textfile:no-default', interpolation=None)
         config.read(file)
         defaults = dict(config['DEFAULT']) if config.has_section('DEFAULT') else {}
-        default_labels = parse_custom_labels(defaults.get('labels', ''), '{} [DEFAULT]'.format(file))
         for k in config.sections():
             if k == 'DEFAULT':
                 continue
             d = dict(defaults)
             d.update(config[k])
             if d:
-                labels = dict(default_labels)
-                labels.update(parse_custom_labels(config[k].get('labels', ''), '{} [{}]'.format(file, k)))
-                # 空值表示这个 job 不要该 label
-                d['custom_labels'] = {name: value for name, value in labels.items() if value != ''}
+                d['custom_labels'] = self.merge_custom_labels(file, defaults, dict(config[k]), k)
                 s = os.path.splitext(os.path.basename(file))[0]
                 d['prom_file_name'] = s + '_' + k
                 logging.debug(
@@ -447,13 +459,9 @@ class prom_metrics():
             # daemon 按配置的 interval 循环；cron 模式由 timer 每 1 分钟跑一次
             'prom_cronjob_interval': config.get('interval') if self.config['daemon'] else 60
         }
-        # 配置中的自定义 label，值已转义为 prom 文本格式
-        self.custom_label = {k: escape_label_value(v) for k, v in config.get('custom_labels', {}).items()}
-        self.labels_conflict = config.get('labels_conflict', 'exported')
-        if self.labels_conflict not in LABELS_CONFLICT:
-            logging.error('{} : invalid labels_conflict "{}", use exported'.format(
-                config.get('prom_file_name'), self.labels_conflict))
-            self.labels_conflict = 'exported'
+        # 配置中的自定义 label：{名字: (转义为 prom 文本格式的值, 'exported' | 'overwrite')}
+        self.custom_label = {k: (escape_label_value(v), mode)
+                             for k, (v, mode) in config.get('custom_labels', {}).items()}
 
 
     def __metric_dict(self, metric: str):
@@ -546,9 +554,9 @@ prom_textfile_job_up 0
             '__label_to_promtext ::  label_dict: {}'.format(label_dict))
         prom_label_text = '{'
         if custom:
-            for name, value in self.custom_label.items():
+            for name, (value, mode) in self.custom_label.items():
                 # exported：和 prometheus honor_labels: false 一样，原 label 改名为 exported_<name>
-                if name in label_dict and self.labels_conflict == 'exported':
+                if name in label_dict and mode == 'exported':
                     exported = 'exported_' + name
                     while exported in label_dict:
                         exported = 'exported_' + exported
