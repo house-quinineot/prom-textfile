@@ -115,12 +115,18 @@ tests/integration.sh
 NODE_EXPORTER_VERSION=1.9.1 tests/integration.sh
 ```
 
-remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。占用端口 19090/19102：
+remote write 集成测试，会下载 prometheus（校验 sha256），先在 prometheus 未启动时缓存数据，再启动 prometheus 验证补传和写入的数据。同时覆盖认证：无认证、basic auth（另起一个带 `--web.config.file` 的 prometheus）、bearer token（prometheus 本身不支持 bearer token，用一个小代理放在前面）。每种情况先用错误凭据（401，数据留在缓存），再用正确凭据（补传）。需要 `htpasswd`（apache2-utils / httpd-tools），占用端口 19090/19091/19092/19102：
 
 ```sh
 tests/integration_remote_write.sh
 # 指定 prometheus 版本，默认 3.5.0
 PROMETHEUS_VERSION=3.5.0 tests/integration_remote_write.sh
+```
+
+root 场景测试（只在 CI 跑：需要免密 sudo，会写 `/var/lib/prom-textfile` 并设置 `fs.protected_regular=2`）：安装脚本后用 sudo 运行，`-c` 指向单个配置文件，`/tmp` 下留有普通用户创建的旧 `/tmp/prom-text-self.txt`：
+
+```sh
+tests/root_scenario.sh
 ```
 
 # CI

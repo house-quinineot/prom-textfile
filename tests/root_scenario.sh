@@ -15,13 +15,17 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 sudo -n true || fail "passwordless sudo required"
 [ -e "$OLD" ] && fail "$OLD already exists, refusing to touch it"
 [ -e "$STATE" ] && fail "$STATE already exists, refusing to touch it"
-echo "fs.protected_regular=$(cat /proc/sys/fs/protected_regular)"
+# 很多发行版默认 fs.protected_regular=2（GitHub runner 是 0），设成 2 才能复现 root 写不了别人在 /tmp 的文件
+PROTECTED="$(cat /proc/sys/fs/protected_regular)"
+sudo sysctl -qw fs.protected_regular=2
+echo "fs.protected_regular=$(cat /proc/sys/fs/protected_regular) (was $PROTECTED)"
 
 WORK="$(mktemp -d)"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   sudo rm -rf "$WORK" "$OLD" "$STATE"
+  sudo sysctl -qw fs.protected_regular="$PROTECTED"
 }
 trap cleanup EXIT
 
