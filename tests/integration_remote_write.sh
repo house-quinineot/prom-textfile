@@ -63,6 +63,9 @@ PIDS+=($!)
 wait_up http://127.0.0.1:19102/metrics
 
 cat > "$WORK/conf/it.ini" <<CONF
+[DEFAULT]
+labels : env=it,a=custom
+
 [rw]
 name : rw
 url : http://127.0.0.1:19102/metrics
@@ -104,7 +107,8 @@ sleep 4
   || fail "first buffered batch missing"
 total=$(query 'count_over_time(prom_textfile_job_count{prom_cronjob_name="rw"}[10m])')
 [ "$total" -ge 6 ] || fail "expected >= 6 samples, got $total"
-[ "$(query 'it_gauge{a="x \"y\"",b="主机",prom_cronjob_name="rw"}')" = "42" ] || fail "it_gauge missing"
+[ "$(query 'it_gauge{a="custom",exported_a="x \"y\"",b="主机",env="it",prom_cronjob_name="rw"}')" = "42" ] \
+  || fail "it_gauge with custom labels missing"
 [ "$(query 'it_inf{prom_cronjob_name="rw"}')" = "+Inf" ] || fail "it_inf missing"
 [ "$(query 'prom_textfile_job_up{prom_cronjob_name="rw"}')" = "1" ] || fail "job_up missing"
 echo "ok: $total samples in prometheus, including backfill"

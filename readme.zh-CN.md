@@ -46,6 +46,50 @@ interval : 30
 | `url` | exporter 的 metrics 地址 |
 | `interval` | 抓取间隔（秒，daemon 模式） |
 | `prometheus_url` | 可选，remote write 地址，见 [remote write](#remote-write) |
+| `labels` | 可选，自定义 label，见 [自定义 label](#自定义-label) |
+| `labels_conflict` | 可选，`exported`（默认）或 `overwrite`，见 [自定义 label](#自定义-label) |
+
+`[DEFAULT]` 中的配置对同一文件里的所有 job 生效，`[DEFAULT]` 本身不是 job。
+
+## 自定义 label
+
+给 job 的所有指标加 label，包括 `prom_textfile_job_up`、`prom_textfile_job_count`，本地 textfile 和 remote write 都生效。`prom_textfile_remote_write_*` 状态指标和 `prom-textfile.prom` 不加。
+
+```ini
+[DEFAULT]
+# 这个文件里的所有 job
+labels : env=prod,dc=sh
+
+[node]
+name : node
+url : http://localhost:9100/metrics
+interval : 30
+
+[mysql]
+name : mysql
+url : http://localhost:9104/metrics
+interval : 30
+# 和 [DEFAULT] 按名字合并：env=staging,dc=sh,team="db,ops"
+labels : env=staging,team="db,ops"
+
+[redis]
+name : redis
+url : http://localhost:9121/metrics
+interval : 30
+# 空值去掉 [DEFAULT] 里的 label：只剩 env=prod
+labels : dc=
+labels_conflict : overwrite
+```
+
+- 格式：`name=value`，逗号分隔；值含逗号或 `"` 时用双引号：`team="db,ops"`、`q="say \"hi\""`。
+- job 的 `labels` 与 `[DEFAULT]` 按 label 名合并，job 优先；空值表示这个 job 去掉该 label。
+- label 名必须匹配 `[a-zA-Z_][a-zA-Z0-9_]*`，`__` 和 `prom_cronjob_` 开头的是保留名。不合法的项记录错误后忽略，job 照常运行。
+- 抓到的指标已有同名 label 时，由 `labels_conflict` 决定：
+
+| `labels_conflict` | 抓到 `env="dev"`，配置 `env=prod` |
+|---|---|
+| `exported`（默认） | `env="prod",exported_env="dev"`，与 prometheus `honor_labels: false` 相同 |
+| `overwrite` | `env="prod"`，丢弃原值 |
 
 # remote write
 

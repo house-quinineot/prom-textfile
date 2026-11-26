@@ -451,6 +451,17 @@ class TestEndToEnd(RemoteWriteServerMixin, unittest.TestCase):
                                          'prom_textfile_remote_write_buffer_files': 0.0,
                                          'prom_textfile_remote_write_rejected_files': 0.0})
 
+    def test_custom_labels_remote_but_not_status(self):
+        with open(os.path.join(self.conf_dir, self.prefix + '.ini'), 'a') as f:
+            f.write('[DEFAULT]\nlabels : env=prod\n')
+        self.run_main()
+        for labels, _, _ in self.sent()[0]:
+            with self.subTest(metric=dict(labels)['__name__']):
+                self.assertEqual(dict(labels)['env'], 'prod')
+        with open(os.path.join(self.out_dir, self.prefix + '_rw_remote_write.prom')) as f:
+            for labels, _ in pt.parse_samples(f.read()):
+                self.assertNotIn('env', labels)
+
     def test_outage_then_backfill(self):
         _RemoteWriteHandler.codes = [503, 503]
         self.run_main()

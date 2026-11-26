@@ -46,6 +46,50 @@ interval : 30
 | `url` | Exporter metrics URL |
 | `interval` | Scrape interval in seconds (daemon mode) |
 | `prometheus_url` | Optional, remote write URL, see [remote write](#remote-write) |
+| `labels` | Optional, custom labels, see [custom labels](#custom-labels) |
+| `labels_conflict` | Optional, `exported` (default) or `overwrite`, see [custom labels](#custom-labels) |
+
+Keys in a `[DEFAULT]` section apply to every job in the same file. `[DEFAULT]` itself is not a job.
+
+## custom labels
+
+Add labels to every metric of a job, including `prom_textfile_job_up` and `prom_textfile_job_count`, both in the local textfile and in remote write. The `prom_textfile_remote_write_*` status metrics and `prom-textfile.prom` are not changed.
+
+```ini
+[DEFAULT]
+# every job in this file
+labels : env=prod,dc=sh
+
+[node]
+name : node
+url : http://localhost:9100/metrics
+interval : 30
+
+[mysql]
+name : mysql
+url : http://localhost:9104/metrics
+interval : 30
+# merged with [DEFAULT] by name: env=staging,dc=sh,team="db,ops"
+labels : env=staging,team="db,ops"
+
+[redis]
+name : redis
+url : http://localhost:9121/metrics
+interval : 30
+# an empty value removes a [DEFAULT] label: env=prod only
+labels : dc=
+labels_conflict : overwrite
+```
+
+- Format: `name=value` separated by commas. Quote a value that contains a comma or `"`: `team="db,ops"`, `q="say \"hi\""`.
+- A job's `labels` is merged with `[DEFAULT]` by label name; the job wins. An empty value removes that label for the job.
+- Label names must match `[a-zA-Z_][a-zA-Z0-9_]*`. Names starting with `__` or `prom_cronjob_` are reserved. Invalid entries are logged as errors and ignored; the job keeps running.
+- When a scraped metric already has a label with the same name, `labels_conflict` decides:
+
+| `labels_conflict` | Scraped `env="dev"`, config `env=prod` |
+|---|---|
+| `exported` (default) | `env="prod",exported_env="dev"`, same as Prometheus with `honor_labels: false` |
+| `overwrite` | `env="prod"`, the scraped value is dropped |
 
 # remote write
 
